@@ -119,7 +119,7 @@ fn process_image(file_path: &Path, args: &Args, fast_meta_path: &Path) -> Result
     let stdout = String::from_utf8_lossy(&output.stdout);
     
     // --- 判定ロジック ---
-    let target = if stdout.contains("ComfyUI") || stdout.contains("workflow") {
+    let target = if stdout.contains("ComfyUI") || stdout.contains("workflow") || stdout.contains("generation_data") {
         TargetType::ComfyUI
     } else if stdout.contains("parameters") || stdout.contains("Stable Diffusion") || 
               stdout.contains("NovelAI") || stdout.contains("Software") || 
