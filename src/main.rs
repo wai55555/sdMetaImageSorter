@@ -49,7 +49,7 @@ fn main() {
 
     if !fast_meta_path.exists() {
         eprintln!("[ERROR] fast_meta.exe not found at {:?}", fast_meta_path);
-        return;
+        std::process::exit(1);
     }
 
     let mut target_files = Vec::new();
@@ -111,6 +111,9 @@ fn main() {
     println!("  -> Skipped: {}", count_skip.load(Ordering::Relaxed));
     println!("  -> Errors: {}", count_error.load(Ordering::Relaxed));
     println!("--------------------------------------------------");
+    if count_error.load(Ordering::Relaxed) > 0 {
+        std::process::exit(1);
+    }
 }
 
 fn process_image(file_path: &Path, args: &Args, fast_meta_path: &Path) -> Result<TargetType, String> {
@@ -149,24 +152,51 @@ fn process_image(file_path: &Path, args: &Args, fast_meta_path: &Path) -> Result
         return Err(format!("Create dir failed: {}", e));
     }
 
-    if let Some(file_name) = file_path.file_name() {
-        let dest_path = dest_dir.join(file_name);
-
-        if file_path == dest_path {
-            return Ok(target);
-        }
-
-        if args.copy {
-            fs::copy(file_path, &dest_path).map_err(|e| format!("Copy failed: {}", e))?;
-        } else {
-            if fs::rename(file_path, &dest_path).is_err() {
-                fs::copy(file_path, &dest_path).map_err(|e| format!("Fallback copy failed: {}", e))?;
-                let _ = fs::remove_file(file_path);
-            }
-        }
+    let file_name = file_path.file_name().ok_or("Cannot get file name")?;
+    let dest_path = dest_dir.join(file_name);
+    if transfer_no_replace(file_path, &dest_path, args.copy)? {
+        Ok(target)
+    } else {
+        Ok(TargetType::None)
     }
 
-    Ok(target)
+}
+
+// Hard links provide an atomic no-replace move on the same filesystem. If unavailable,
+// create_new reserves the destination before copying; never truncate an existing file.
+fn transfer_no_replace(source: &Path, dest: &Path, copy: bool) -> Result<bool, String> {
+    let metadata = fs::symlink_metadata(source).map_err(|e| format!("Source metadata failed: {}", e))?;
+    if !metadata.file_type().is_file() {
+        return Err("Source is not a regular file".to_string());
+    }
+    if !copy {
+        match fs::hard_link(source, dest) {
+            Ok(()) => {
+                fs::remove_file(source).map_err(|e| format!("Source removal failed after linking: {}", e))?;
+                return Ok(true);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(false),
+            Err(_) => {} // Cross-device or unsupported: use an exclusive copy.
+        }
+    }
+    let mut input = fs::File::open(source).map_err(|e| format!("Open source failed: {}", e))?;
+    let mut output = match fs::OpenOptions::new().write(true).create_new(true).open(dest) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(false),
+        Err(e) => return Err(format!("Create destination failed: {}", e)),
+    };
+    if let Err(e) = std::io::copy(&mut input, &mut output) {
+        drop(output);
+        return match fs::remove_file(dest) {
+            Ok(()) => Err(format!("Copy failed: {}", e)),
+            Err(cleanup) => Err(format!("Copy failed: {}; cannot remove incomplete destination: {}", e, cleanup)),
+        };
+    }
+    drop(output);
+    if !copy {
+        fs::remove_file(source).map_err(|e| format!("Source removal failed after copying: {}", e))?;
+    }
+    Ok(true)
 }
 
 // The first line contains the input path, not metadata.
@@ -190,6 +220,51 @@ fn classify_metadata(output: &str) -> TargetType {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transfers_never_replace_existing_files() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!("sd-sorter-test-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+        fs::create_dir(&dir).unwrap();
+        let source = dir.join("source");
+        let dest = dir.join("dest");
+        fs::write(&source, b"source").unwrap();
+        fs::write(&dest, b"existing").unwrap();
+        for copy in [true, false] {
+            assert!(!transfer_no_replace(&source, &dest, copy).unwrap());
+            assert_eq!(fs::read(&source).unwrap(), b"source");
+            assert_eq!(fs::read(&dest).unwrap(), b"existing");
+        }
+        fs::remove_file(&dest).unwrap();
+        assert!(transfer_no_replace(&source, &dest, true).unwrap());
+        assert_eq!(fs::read(&source).unwrap(), b"source");
+        fs::remove_file(&dest).unwrap();
+        assert!(transfer_no_replace(&source, &dest, false).unwrap());
+        assert!(!source.exists());
+        assert_eq!(fs::read(&dest).unwrap(), b"source");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn concurrent_copies_do_not_overwrite() {
+        let dir = std::env::temp_dir().join(format!("sd-sorter-race-{}", std::process::id()));
+        fs::create_dir(&dir).unwrap();
+        let a = dir.join("a");
+        let b = dir.join("b");
+        let dest = dir.join("dest");
+        fs::write(&a, b"first").unwrap();
+        fs::write(&b, b"second").unwrap();
+        std::thread::scope(|scope| {
+            let one = scope.spawn(|| transfer_no_replace(&a, &dest, true).unwrap());
+            let two = scope.spawn(|| transfer_no_replace(&b, &dest, true).unwrap());
+            assert_ne!(one.join().unwrap(), two.join().unwrap());
+        });
+        let result = fs::read(&dest).unwrap();
+        assert!(result == b"first" || result == b"second");
+        assert!(transfer_no_replace(&dir.join("missing"), &dir.join("other"), true).is_err());
+        fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn classifies_novelai_before_generic_metadata() {
