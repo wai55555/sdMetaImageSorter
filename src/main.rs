@@ -115,21 +115,11 @@ fn process_image(file_path: &Path, args: &Args, fast_meta_path: &Path) -> Result
     let output = cmd.output().map_err(|e| format!("Exec failed: {}", e))?;
     
     if !output.status.success() {
-        return Ok(TargetType::None);
+        return Err(format!("Metadata extraction failed ({}): {}", output.status, String::from_utf8_lossy(&output.stderr).trim()));
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    
-    // 判定ロジック
-    let target = if stdout.contains("ComfyUI") || stdout.contains("workflow") || stdout.contains("generation_data") {
-        TargetType::ComfyUI
-    } else if stdout.contains("parameters") || stdout.contains("Stable Diffusion") || 
-              stdout.contains("NovelAI") || stdout.contains("Software") || 
-              stdout.contains("Steps: ") {
-        TargetType::WebUI
-    } else {
-        TargetType::None
-    };
+    let target = classify_metadata(&stdout);
 
     if target == TargetType::None {
         return Ok(TargetType::None);
@@ -169,4 +159,31 @@ fn process_image(file_path: &Path, args: &Args, fast_meta_path: &Path) -> Result
     }
 
     Ok(target)
+}
+
+// The first line contains the input path, not metadata.
+fn classify_metadata(output: &str) -> TargetType {
+    let metadata = output.lines().skip(1).collect::<Vec<_>>().join("\n");
+    if metadata.contains("--- workflow ---") || metadata.contains("--- generation_data ---") || metadata.contains("\"workflow\"") || metadata.contains("\"generation_data\"") || metadata.contains("ComfyUI") {
+        TargetType::ComfyUI
+    } else if metadata.contains("parameters") || metadata.contains("Stable Diffusion") ||
+              metadata.contains("NovelAI") || metadata.contains("Software") ||
+              metadata.contains("Steps: ") || metadata.contains("--- Stealth PNG Info (") {
+        TargetType::WebUI
+    } else {
+        TargetType::None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classifies_stealth_and_ignores_the_input_path() {
+        assert_eq!(classify_metadata("=== PNG File: NovelAI-workflow.png ===\n(No metadata detected)"), TargetType::None);
+        assert_eq!(classify_metadata("=== PNG File: x.png ===\n--- Stealth PNG Info (Alpha) [stealth_pnginfo] ---\nopaque data"), TargetType::WebUI);
+        assert_eq!(classify_metadata("=== PNG File: x.png ===\n--- Stealth PNG Info (RGB) [stealth_rgbcomp] ---\nComfyUI workflow"), TargetType::ComfyUI);
+        assert_eq!(classify_metadata("=== PNG File: x.png ===\n--- workflow ---\n{}"), TargetType::ComfyUI);
+    }
 }
