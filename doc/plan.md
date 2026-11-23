@@ -16,4 +16,4 @@ NovelAI と ComfyUI は fast_meta の形式見出しを優先して判定する�
 
 ## 整理先フォルダ名
 
-既定名は `comfyui_img`、`webui_img`、`NovelAI_img` に統一する。整理前に旧既定名 `webui_image` と `NovelAI` を新しい既定名へリネームする。新旧の両方がある場合は中身を統合し、同名ファイルは上書きせず連番付きの名前で新フォルダ内に保持する。
+既定名は `comfyui_img`、`webui_img`、`NovelAI_img` に統一する。整理前に旧既定名 `webui_image` を `webui_img` へリネームする。NovelAI の旧フォルダ名は未リリースのため移行も走査除外もしない。新旧の両方がある場合は中身を統合し、同名ファイルは上書きせず連番付きの名前で新フォルダ内に保持する。

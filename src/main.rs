@@ -7,7 +7,7 @@ use std::env;
 use walkdir::WalkDir;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-const LEGACY_OUTPUT_DIR_NAMES: [&str; 2] = ["webui_image", "NovelAI"];
+const LEGACY_WEBUI_OUTPUT_DIR_NAME: &str = "webui_image";
 
 #[derive(Parser)]
 #[command(name = "sd_meta_sorter", version = "4.4")]
@@ -129,10 +129,8 @@ fn main() {
 
 
 fn legacy_target_name<'a>(name: &str, args: &'a Args) -> Option<&'a str> {
-    if name.eq_ignore_ascii_case(LEGACY_OUTPUT_DIR_NAMES[0]) {
+    if name.eq_ignore_ascii_case(LEGACY_WEBUI_OUTPUT_DIR_NAME) {
         Some(&args.webui_dir_name)
-    } else if name.eq_ignore_ascii_case(LEGACY_OUTPUT_DIR_NAMES[1]) {
-        Some(&args.novelai_dir_name)
     } else {
         None
     }
