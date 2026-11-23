@@ -2,14 +2,15 @@
 
 **SD Meta Image Sorter** は、AI生成画像（Stable Diffusion WebUI, ComfyUI, NovelAIなど）のメタデータを解析し、自動的にフォルダ分けを行うRust製の高速CLIツールです。
 
-画像ファイル（PNG, JPG, WEBP, AVIF）に含まれるメタデータをスキャンし、ComfyUIで作られた画像と、それ以外（A1111 WebUI, NovelAIなど）を判別して整理します。
+画像ファイル（PNG, JPG, WEBP, AVIF）に含まれるメタデータをスキャンし、ComfyUI、NovelAI、WebUI などを判別して整理します。
 
 ## 特徴
 
 *   **高速動作**: Rust言語と並列処理（Rayon）により、大量の画像も一瞬でスキャン・仕分けします。
 *   **インテリジェントな仕分け**:
     *   **ComfyUI**: `comfyui_img` フォルダへ移動
-    *   **WebUI / NovelAI**: `webui_image` フォルダへ移動
+    *   **WebUI**: `webui_image` フォルダへ移動
+    *   **NovelAI**: `NovelAI` フォルダへ移動
     *   **メタデータなし**: 移動せず、そのまま無視（スキップ）
 *   **無駄のない動作**: 仕分け対象の画像が見つかった場合のみ、その画像があるフォルダ内にサブフォルダを作成します。空のフォルダは作られません。
 *   **ステルス情報**: 対応版 `fast_meta.exe` の Stealth PNG Info を検出します。生成元が不明な場合は WebUI として扱います。
@@ -65,8 +66,9 @@ Arguments:
   <INPUTS>...    入力ファイルまたはディレクトリへのパス
 
 Options:
-  -c, --comfy-dir <NAME>    ComfyUI用フォルダ名 (デフォルト: comfyui_img)
-  -w, --webui-dir <NAME>    WebUI/NovelAI用フォルダ名 (デフォルト: webui_image)
+  -c, --comfy-dir-name <NAME>    ComfyUI用フォルダ名 (デフォルト: comfyui_img)
+  -w, --webui-dir-name <NAME>    WebUI用フォルダ名 (デフォルト: webui_image)
+  -n, --novelai-dir <NAME> NovelAI用フォルダ名 (デフォルト: NovelAI)
       --copy                ファイルを移動せず、コピーする
   -h, --help                ヘルプを表示
 ```

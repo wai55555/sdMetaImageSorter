@@ -19,6 +19,9 @@ struct Args {
     #[arg(short = 'w', long, default_value = "webui_image")]
     webui_dir_name: String,
 
+    #[arg(short = 'n', long = "novelai-dir", default_value = "NovelAI")]
+    novelai_dir_name: String,
+
     #[arg(long)]
     copy: bool,
 }
@@ -27,6 +30,7 @@ struct Args {
 enum TargetType {
     ComfyUI,
     WebUI,
+    NovelAI,
     None,
 }
 
@@ -35,6 +39,7 @@ fn main() {
 
     let count_comfy = AtomicUsize::new(0);
     let count_webui = AtomicUsize::new(0);
+    let count_novelai = AtomicUsize::new(0);
     let count_skip = AtomicUsize::new(0);
     let count_error = AtomicUsize::new(0);
 
@@ -60,7 +65,7 @@ fn main() {
                 // ディレクトリかつ名前が仕分け先と同じならスキップ(再帰しない)
                 if entry.file_type().is_dir() {
                     let name = entry.file_name().to_string_lossy();
-                    if name == args.comfy_dir_name || name == args.webui_dir_name {
+                    if name == args.comfy_dir_name || name == args.webui_dir_name || name == args.novelai_dir_name {
                         return false; 
                     }
                 }
@@ -89,6 +94,7 @@ fn main() {
         match process_image(file_path, &args, &fast_meta_path) {
             Ok(TargetType::ComfyUI) => { count_comfy.fetch_add(1, Ordering::Relaxed); },
             Ok(TargetType::WebUI) => { count_webui.fetch_add(1, Ordering::Relaxed); },
+            Ok(TargetType::NovelAI) => { count_novelai.fetch_add(1, Ordering::Relaxed); },
             Ok(TargetType::None) => { count_skip.fetch_add(1, Ordering::Relaxed); },
             Err(e) => {
                 eprintln!("[ERROR] {:?}: {}", file_path, e);
@@ -100,7 +106,8 @@ fn main() {
     println!("--------------------------------------------------");
     println!("Total Scanned: {}", total);
     println!("  -> ComfyUI: {}", count_comfy.load(Ordering::Relaxed));
-    println!("  -> WebUI/NovelAI: {}", count_webui.load(Ordering::Relaxed));
+    println!("  -> WebUI: {}", count_webui.load(Ordering::Relaxed));
+    println!("  -> NovelAI: {}", count_novelai.load(Ordering::Relaxed));
     println!("  -> Skipped: {}", count_skip.load(Ordering::Relaxed));
     println!("  -> Errors: {}", count_error.load(Ordering::Relaxed));
     println!("--------------------------------------------------");
@@ -131,6 +138,7 @@ fn process_image(file_path: &Path, args: &Args, fast_meta_path: &Path) -> Result
     let folder_name = match target {
         TargetType::ComfyUI => &args.comfy_dir_name,
         TargetType::WebUI => &args.webui_dir_name,
+        TargetType::NovelAI => &args.novelai_dir_name,
         _ => unreachable!(),
     };
 
@@ -164,10 +172,14 @@ fn process_image(file_path: &Path, args: &Args, fast_meta_path: &Path) -> Result
 // The first line contains the input path, not metadata.
 fn classify_metadata(output: &str) -> TargetType {
     let metadata = output.lines().skip(1).collect::<Vec<_>>().join("\n");
-    if metadata.contains("--- workflow ---") || metadata.contains("--- generation_data ---") || metadata.contains("\"workflow\"") || metadata.contains("\"generation_data\"") || metadata.contains("ComfyUI") {
+    if metadata.contains("--- NovelAI [") {
+        TargetType::NovelAI
+    } else if metadata.contains("--- workflow ---") || metadata.contains("--- generation_data ---") || metadata.contains("\"workflow\"") || metadata.contains("\"generation_data\"") || metadata.contains("ComfyUI") {
         TargetType::ComfyUI
+    } else if metadata.contains("NovelAI") || metadata.contains("novelai") {
+        TargetType::NovelAI
     } else if metadata.contains("parameters") || metadata.contains("Stable Diffusion") ||
-              metadata.contains("NovelAI") || metadata.contains("Software") ||
+              metadata.contains("Software") ||
               metadata.contains("Steps: ") || metadata.contains("--- Stealth PNG Info (") {
         TargetType::WebUI
     } else {
@@ -178,6 +190,13 @@ fn classify_metadata(output: &str) -> TargetType {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn classifies_novelai_before_generic_metadata() {
+        assert_eq!(classify_metadata("=== PNG File: x.png ===\n--- NovelAI [Settings] ---\n{\"steps\": 28}"), TargetType::NovelAI);
+        assert_eq!(classify_metadata("=== PNG File: x.png ===\n--- Stealth PNG Info (Alpha) [stealth_pnginfo] ---\n{\"Software\":\"NovelAI\"}"), TargetType::NovelAI);
+        assert_eq!(classify_metadata("=== PNG File: x.png ===\n--- Stable Diffusion (A1111) ---\nSteps: 20"), TargetType::WebUI);
+    }
 
     #[test]
     fn classifies_stealth_and_ignores_the_input_path() {
