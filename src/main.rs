@@ -202,15 +202,20 @@ fn transfer_no_replace(source: &Path, dest: &Path, copy: bool) -> Result<bool, S
 // The first line contains the input path, not metadata.
 fn classify_metadata(output: &str) -> TargetType {
     let metadata = output.lines().skip(1).collect::<Vec<_>>().join("\n");
+    let normalized = metadata.to_ascii_lowercase();
+
+    // Prefer format headers over words in free-text prompts or stealth payloads.
     if metadata.contains("--- NovelAI [") {
         TargetType::NovelAI
-    } else if metadata.contains("--- workflow ---") || metadata.contains("--- generation_data ---") || metadata.contains("\"workflow\"") || metadata.contains("\"generation_data\"") || metadata.contains("ComfyUI") {
+    } else if metadata.contains("--- workflow ---") ||
+              metadata.contains("--- generation_data ---") ||
+              metadata.contains("--- prompt ---") {
         TargetType::ComfyUI
-    } else if metadata.contains("NovelAI") || metadata.contains("novelai") {
+    } else if normalized.contains("novelai") {
         TargetType::NovelAI
     } else if metadata.contains("parameters") || metadata.contains("Stable Diffusion") ||
-              metadata.contains("Software") ||
-              metadata.contains("Steps: ") || metadata.contains("--- Stealth PNG Info (") {
+              metadata.contains("Software") || metadata.contains("Steps: ") ||
+              metadata.contains("--- Stealth PNG Info (") {
         TargetType::WebUI
     } else {
         TargetType::None
