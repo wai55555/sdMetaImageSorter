@@ -54,26 +54,29 @@ fn main() {
         std::process::exit(1);
     }
 
+    let mut scan_inputs = Vec::with_capacity(args.inputs.len());
+    for input in &args.inputs {
+        match prepare_input_path(Path::new(input), &args) {
+            Ok(path) => scan_inputs.push(path),
+            Err(e) => {
+                eprintln!("[ERROR] Could not migrate existing output folders: {}", e);
+                std::process::exit(1);
+            }
+        }
+    }
+
     let mut target_files = Vec::new();
     let supported_extensions = ["png", "jpg", "jpeg", "webp", "avif"];
 
-    println!("Scanning inputs (Skipping output folders)...");
+    println!("Scanning inputs (migrating old output folders first)...");
     
-    for input in &args.inputs {
-        let path = Path::new(input);
+    for path in &scan_inputs {
         if path.is_dir() {
             // ★修正箇所: .into_iter() を追加しました
             let walker = WalkDir::new(path).into_iter().filter_entry(|entry| {
-                // ディレクトリかつ名前が仕分け先と同じならスキップ(再帰しない)
                 if entry.file_type().is_dir() {
                     let name = entry.file_name().to_string_lossy();
-                    let is_current_output = [&args.comfy_dir_name, &args.webui_dir_name, &args.novelai_dir_name]
-                        .iter()
-                        .any(|output_name| name.eq_ignore_ascii_case(output_name));
-                    let is_legacy_output = LEGACY_OUTPUT_DIR_NAMES
-                        .iter()
-                        .any(|output_name| name.eq_ignore_ascii_case(output_name));
-                    if is_current_output || is_legacy_output {
+                    if is_current_output_name(&name, &args) || legacy_target_name(&name, &args).is_some() {
                         return false;
                     }
                 }
@@ -121,6 +124,213 @@ fn main() {
     println!("--------------------------------------------------");
     if count_error.load(Ordering::Relaxed) > 0 {
         std::process::exit(1);
+    }
+}
+
+
+fn legacy_target_name<'a>(name: &str, args: &'a Args) -> Option<&'a str> {
+    if name.eq_ignore_ascii_case(LEGACY_OUTPUT_DIR_NAMES[0]) {
+        Some(&args.webui_dir_name)
+    } else if name.eq_ignore_ascii_case(LEGACY_OUTPUT_DIR_NAMES[1]) {
+        Some(&args.novelai_dir_name)
+    } else {
+        None
+    }
+}
+
+fn is_current_output_name(name: &str, args: &Args) -> bool {
+    name.eq_ignore_ascii_case(&args.comfy_dir_name) ||
+    name.eq_ignore_ascii_case(&args.webui_dir_name) ||
+    name.eq_ignore_ascii_case(&args.novelai_dir_name)
+}
+
+fn prepare_input_path(path: &Path, args: &Args) -> Result<std::path::PathBuf, String> {
+    if path.is_dir() {
+        if let Some(name) = path.file_name().map(|name| name.to_string_lossy()) {
+            if let Some(target_name) = legacy_target_name(&name, args) {
+                if !name.eq_ignore_ascii_case(target_name) {
+                    let parent = path.parent().ok_or("Legacy output folder has no parent")?;
+                    let destination = parent.join(target_name);
+                    migrate_legacy_directory(path, &destination)?;
+                    migrate_legacy_output_dirs(parent, args)?;
+                    return Ok(destination);
+                }
+            }
+            if is_current_output_name(&name, args) {
+                return Ok(path.to_path_buf());
+            }
+        }
+        migrate_legacy_output_dirs(path, args)?;
+        return Ok(path.to_path_buf());
+    }
+
+    if path.is_file() {
+        let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+        let mut ancestor = Some(parent);
+        while let Some(dir) = ancestor {
+            if let Some(name) = dir.file_name().map(|name| name.to_string_lossy()) {
+                if let Some(target_name) = legacy_target_name(&name, args) {
+                    if !name.eq_ignore_ascii_case(target_name) {
+                        let old_root = dir.to_path_buf();
+                        let new_root = dir.parent().ok_or("Legacy output folder has no parent")?.join(target_name);
+                        let relative = path.strip_prefix(&old_root).map_err(|e| format!("Resolve legacy file path failed: {}", e))?;
+                        migrate_legacy_directory(&old_root, &new_root)?;
+                        if let Some(parent) = new_root.parent() {
+                            migrate_legacy_output_dirs(parent, args)?;
+                        }
+                        return Ok(new_root.join(relative));
+                    }
+                }
+            }
+            ancestor = dir.parent();
+        }
+        migrate_legacy_output_dirs(parent, args)?;
+        return Ok(path.to_path_buf());
+    }
+
+    Ok(path.to_path_buf())
+}
+
+fn migrate_legacy_output_dirs(root: &Path, args: &Args) -> Result<(), String> {
+    if let Some(name) = root.file_name().map(|name| name.to_string_lossy()) {
+        if let Some(target_name) = legacy_target_name(&name, args) {
+            if !name.eq_ignore_ascii_case(target_name) {
+                let parent = root.parent().ok_or("Legacy output folder has no parent")?;
+                return migrate_legacy_directory(root, &parent.join(target_name));
+            }
+        }
+        if is_current_output_name(&name, args) {
+            return Ok(());
+        }
+    }
+
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(parent) = pending.pop() {
+        let entries = fs::read_dir(&parent)
+            .map_err(|e| format!("Read directory {:?} failed: {}", parent, e))?;
+        for entry in entries {
+            let entry = entry.map_err(|e| format!("Read directory entry in {:?} failed: {}", parent, e))?;
+            let file_type = entry.file_type()
+                .map_err(|e| format!("Read file type for {:?} failed: {}", entry.path(), e))?;
+            if !file_type.is_dir() {
+                continue;
+            }
+
+            let child = entry.path();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if let Some(target_name) = legacy_target_name(&name, args) {
+                if !name.eq_ignore_ascii_case(target_name) {
+                    migrate_legacy_directory(&child, &parent.join(target_name))?;
+                }
+            } else if !is_current_output_name(&name, args) {
+                pending.push(child);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn migrate_legacy_directory(source: &Path, destination: &Path) -> Result<(), String> {
+    if source == destination {
+        return Ok(());
+    }
+    match fs::symlink_metadata(destination) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            fs::rename(source, destination)
+                .map_err(|e| format!("Rename {:?} to {:?} failed: {}", source, destination, e))?;
+            println!("[INFO] Renamed legacy folder {:?} -> {:?}", source, destination);
+        }
+        Err(e) => return Err(format!("Inspect destination {:?} failed: {}", destination, e)),
+        Ok(metadata) if metadata.file_type().is_dir() => {
+            merge_legacy_directory_contents(source, destination)?;
+            fs::remove_dir(source)
+                .map_err(|e| format!("Remove migrated legacy folder {:?} failed: {}", source, e))?;
+            println!("[INFO] Merged legacy folder {:?} into {:?}", source, destination);
+        }
+        Ok(_) => return Err(format!("Migration destination exists and is not a directory: {:?}", destination)),
+    }
+    Ok(())
+}
+
+fn merge_legacy_directory_contents(source: &Path, destination: &Path) -> Result<(), String> {
+    let entries = fs::read_dir(source)
+        .map_err(|e| format!("Read legacy folder {:?} failed: {}", source, e))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("Read legacy folder entry in {:?} failed: {}", source, e))?;
+        let source_entry = entry.path();
+        let destination_entry = destination.join(entry.file_name());
+        let source_type = entry.file_type()
+            .map_err(|e| format!("Read file type for {:?} failed: {}", source_entry, e))?;
+        let destination_metadata = match fs::symlink_metadata(&destination_entry) {
+            Ok(metadata) => Some(metadata),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(format!("Inspect {:?} failed: {}", destination_entry, e)),
+        };
+
+        if source_type.is_dir() && destination_metadata.as_ref().is_some_and(|m| m.file_type().is_dir()) {
+            merge_legacy_directory_contents(&source_entry, &destination_entry)?;
+            fs::remove_dir(&source_entry)
+                .map_err(|e| format!("Remove merged directory {:?} failed: {}", source_entry, e))?;
+        } else if destination_metadata.is_none() {
+            if source_type.is_file() {
+                if !transfer_no_replace(&source_entry, &destination_entry, false)? {
+                    move_legacy_conflict(&source_entry, destination, &entry.file_name())?;
+                }
+            } else {
+                fs::rename(&source_entry, &destination_entry)
+                    .map_err(|e| format!("Move {:?} to {:?} failed: {}", source_entry, destination_entry, e))?;
+            }
+        } else {
+            move_legacy_conflict(&source_entry, destination, &entry.file_name())?;
+        }
+    }
+    Ok(())
+}
+
+fn move_legacy_conflict(source: &Path, destination_dir: &Path, original_name: &std::ffi::OsStr) -> Result<(), String> {
+    let source_metadata = fs::symlink_metadata(source)
+        .map_err(|e| format!("Inspect conflict source {:?} failed: {}", source, e))?;
+    for index in 1..=10_000usize {
+        let destination = legacy_conflict_path(destination_dir, original_name, index);
+        if source_metadata.file_type().is_file() {
+            if transfer_no_replace(source, &destination, false)? {
+                println!("[INFO] Preserved filename conflict as {:?}", destination);
+                return Ok(());
+            }
+        } else if source_metadata.file_type().is_dir() {
+            match fs::create_dir(&destination) {
+                Ok(()) => {
+                    merge_legacy_directory_contents(source, &destination)?;
+                    fs::remove_dir(source)
+                        .map_err(|e| format!("Remove merged conflict folder {:?} failed: {}", source, e))?;
+                    println!("[INFO] Preserved folder conflict as {:?}", destination);
+                    return Ok(());
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(format!("Create conflict folder {:?} failed: {}", destination, e)),
+            }
+        } else {
+            match fs::rename(source, &destination) {
+                Ok(()) => {
+                    println!("[INFO] Preserved filename conflict as {:?}", destination);
+                    return Ok(());
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(format!("Move conflict {:?} to {:?} failed: {}", source, destination, e)),
+            }
+        }
+    }
+    Err(format!("Could not find a free conflict name for {:?}", source))
+}
+
+fn legacy_conflict_path(parent: &Path, name: &std::ffi::OsStr, index: usize) -> std::path::PathBuf {
+    let name = name.to_string_lossy();
+    let path = Path::new(name.as_ref());
+    if let Some(extension) = path.extension() {
+        let stem = path.file_stem().unwrap_or(std::ffi::OsStr::new(name.as_ref()));
+        parent.join(format!("{}__legacy_{}.{}", stem.to_string_lossy(), index, extension.to_string_lossy()))
+    } else {
+        parent.join(format!("{}__legacy_{}", name, index))
     }
 }
 
