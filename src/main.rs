@@ -7,6 +7,8 @@ use std::env;
 use walkdir::WalkDir;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+const LEGACY_OUTPUT_DIR_NAMES: [&str; 2] = ["webui_image", "NovelAI"];
+
 #[derive(Parser)]
 #[command(name = "sd_meta_sorter", version = "4.4")]
 struct Args {
@@ -16,10 +18,10 @@ struct Args {
     #[arg(short = 'c', long, default_value = "comfyui_img")]
     comfy_dir_name: String,
 
-    #[arg(short = 'w', long, default_value = "webui_image")]
+    #[arg(short = 'w', long, default_value = "webui_img")]
     webui_dir_name: String,
 
-    #[arg(short = 'n', long = "novelai-dir", default_value = "NovelAI")]
+    #[arg(short = 'n', long = "novelai-dir", default_value = "NovelAI_img")]
     novelai_dir_name: String,
 
     #[arg(long)]
@@ -65,8 +67,14 @@ fn main() {
                 // ディレクトリかつ名前が仕分け先と同じならスキップ(再帰しない)
                 if entry.file_type().is_dir() {
                     let name = entry.file_name().to_string_lossy();
-                    if name == args.comfy_dir_name || name == args.webui_dir_name || name == args.novelai_dir_name {
-                        return false; 
+                    let is_current_output = [&args.comfy_dir_name, &args.webui_dir_name, &args.novelai_dir_name]
+                        .iter()
+                        .any(|output_name| name.eq_ignore_ascii_case(output_name));
+                    let is_legacy_output = LEGACY_OUTPUT_DIR_NAMES
+                        .iter()
+                        .any(|output_name| name.eq_ignore_ascii_case(output_name));
+                    if is_current_output || is_legacy_output {
+                        return false;
                     }
                 }
                 true

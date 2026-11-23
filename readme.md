@@ -9,11 +9,12 @@
 *   **高速動作**: Rust言語と並列処理（Rayon）により、大量の画像も一瞬でスキャン・仕分けします。
 *   **インテリジェントな仕分け**:
     *   **ComfyUI**: `comfyui_img` フォルダへ移動
-    *   **WebUI**: `webui_image` フォルダへ移動
-    *   **NovelAI**: `NovelAI` フォルダへ移動
+    *   **WebUI**: `webui_img` フォルダへ移動
+    *   **NovelAI**: `NovelAI_img` フォルダへ移動
     *   **メタデータなし**: 移動せず、そのまま無視（スキップ）
 *   **無駄のない動作**: 仕分け対象の画像が見つかった場合のみ、その画像があるフォルダ内にサブフォルダを作成します。空のフォルダは作られません。
 *   **ステルス情報**: 対応版 `fast_meta.exe` の Stealth PNG Info を検出します。生成元が不明な場合は WebUI として扱います。
+*   **旧フォルダの除外**: 既定名を変更した後も、従来の `webui_image` と `NovelAI` は再走査しません。
 *   **重複の保護**: 整理先に同名の項目がある場合は、上書きせずスキップします。
 *   **移動/コピー対応**: デフォルトは「移動」ですが、`--copy` オプションで「複製」も可能です。
 *   **安全性**: 整理先の既存ファイルを上書きせず、操作失敗を報告します。
@@ -68,8 +69,8 @@ Arguments:
 
 Options:
   -c, --comfy-dir-name <NAME>    ComfyUI用フォルダ名 (デフォルト: comfyui_img)
-  -w, --webui-dir-name <NAME>    WebUI用フォルダ名 (デフォルト: webui_image)
-  -n, --novelai-dir <NAME> NovelAI用フォルダ名 (デフォルト: NovelAI)
+  -w, --webui-dir-name <NAME>    WebUI用フォルダ名 (デフォルト: webui_img)
+  -n, --novelai-dir <NAME> NovelAI用フォルダ名 (デフォルト: NovelAI_img)
       --copy                ファイルを移動せず、コピーする
   -h, --help                ヘルプを表示
 ```
@@ -97,8 +98,10 @@ C:\Images\
 C:\Images\
   ├── comfyui_img\
   │     └── 001.png
-  ├── webui_image\
+  ├── webui_img\
   │     └── 002.png
+  ├── NovelAI_img\
+  │     └── 004.png  (NovelAI製)
   ├── 003.jpg  (そのまま)
 ```
 

@@ -13,3 +13,7 @@
 ## 分類の優先順位
 
 NovelAI と ComfyUI は fast_meta の形式見出しを優先して判定する。プロンプトやステルス本文に含まれる一般語だけでは ComfyUI に分類せず、生成元が分からないステルス情報は WebUI に整理する。
+
+## 整理先フォルダ名
+
+既定名は `comfyui_img`、`webui_img`、`NovelAI_img` に統一する。既存ユーザーの再走査を避けるため、旧既定名 `webui_image` と `NovelAI` も走査対象から除外する。
