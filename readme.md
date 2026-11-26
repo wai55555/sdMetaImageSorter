@@ -1,8 +1,8 @@
 # SD Meta Image Sorter
 
-**SD Meta Image Sorter** は、AI生成画像（Stable Diffusion WebUI, ComfyUI, NovelAIなど）のメタデータを解析し、自動的にフォルダ分けを行うRust製の高速CLIツールです。
+**SD Meta Image Sorter** は、AI生成画像（Stable Diffusion WebUI, ComfyUI, NovelAI, SwarmUI, InvokeAIなど）のメタデータを解析し、自動的にフォルダ分けを行うRust製の高速CLIツールです。
 
-画像ファイル（PNG, JPG, WEBP, AVIF）に含まれるメタデータをスキャンし、ComfyUI、NovelAI、WebUI などを判別して整理します。
+画像ファイル（PNG, JPG, WEBP, AVIF）に含まれるメタデータをスキャンし、ComfyUI、WebUI、NovelAI、SwarmUI、InvokeAI を判別して整理します。AVIF は現行の解析エンジンが未対応のためスキップされます。
 
 ## 特徴
 
@@ -11,9 +11,11 @@
     *   **ComfyUI**: `comfyui_img` フォルダへ移動
     *   **WebUI**: `webui_img` フォルダへ移動
     *   **NovelAI**: `NovelAI_img` フォルダへ移動
+    *   **SwarmUI**: `SwarmUI_img` フォルダへ移動
+    *   **InvokeAI**: `InvokeAI_img` フォルダへ移動
     *   **メタデータなし**: 移動せず、そのまま無視（スキップ）
 *   **無駄のない動作**: 仕分け対象の画像が見つかった場合のみ、その画像があるフォルダ内にサブフォルダを作成します。空のフォルダは作られません。
-*   **ステルス情報**: 対応版 `fast_meta.exe` の Stealth PNG Info を検出します。生成元が不明な場合は WebUI として扱います。
+*   **ステルス情報**: 内蔵の fast_meta ライブラリが Stealth PNG Info を検出します。本文に `workflow` を含めば ComfyUI、`novelai` を含めば NovelAI、生成元が不明な場合は WebUI として扱います。
 *   **旧フォルダの移行**: 整理開始前に従来の `webui_image` を `webui_img` へ移します。同名ファイルがある場合は上書きせず、`__legacy_1` などの連番を付けて残します。
 *   **重複の保護**: 整理先に同名の項目がある場合は、上書きせずスキップします。
 *   **移動/コピー対応**: デフォルトは「移動」ですが、`--copy` オプションで「複製」も可能です。
@@ -21,29 +23,27 @@
 
 ## 動作の仕組み
 
-本ツールは以下の2つのバイナリで構成します。
-
-1.  **`sd_meta_sorter.exe`**: ユーザーが実行するメインプログラム。フォルダの探索、並列処理の管理、ファイル操作（移動/コピー）を行います。
-2.  **`fast_meta.exe`**: 内部で使用される解析エンジン。単一ファイルのバイナリを高速スキャンし、AI生成メタデータの痕跡を探します。
+本ツールは単一の `sd_meta_sorter.exe` で動作します。画像の解析には
+[fast_meta](https://github.com/wai55555/checkImageMetadata) v2.1.0 をライブラリとして
+プロセス内で呼び出します。`fast_meta.exe` を別途ダウンロードしたり、同じフォルダに
+置いたりする必要はありません。
 
 ## インストール
-リリースページから最新の `sd_meta_sorter.exe` をダウンロードします。
-[fast_meta.exe](https://github.com/wai55555/checkImageMetadata/releases)をダウンロードします。
 
+リリースページから最新の `sd_meta_sorter.exe` をダウンロードして実行します。
 
 ## ビルド方法
-Rust環境（Cargo）が必要です。
+
+Rust 環境（Cargo）と C コンパイラが必要です。fast_meta の既定 feature である
+`zlib-ng` がネイティブビルドされるためです。
 
 ```bash
 git clone https://github.com/your-username/sdMetaImageSorter.git
 cd sdMetaImageSorter
-cargo build --release
+cargo build --release --locked
 ```
 
-ビルドが完了すると `target/release/` に `sd_meta_sorter.exe` が生成されます。`fast_meta.exe` は別途ダウンロードまたはビルドしてください。
-
-> [!IMPORTANT]
-> **重要:** 実行時は必ず `sd_meta_sorter.exe` と `fast_meta.exe` を**同じフォルダ**に置いてください。
+ビルドが完了すると `target/release/sd_meta_sorter.exe` が生成されます。
 
 ## 使い道
 
@@ -70,10 +70,15 @@ Arguments:
 Options:
   -c, --comfy-dir-name <NAME>    ComfyUI用フォルダ名 (デフォルト: comfyui_img)
   -w, --webui-dir-name <NAME>    WebUI用フォルダ名 (デフォルト: webui_img)
-  -n, --novelai-dir <NAME> NovelAI用フォルダ名 (デフォルト: NovelAI_img)
-      --copy                ファイルを移動せず、コピーする
-  -h, --help                ヘルプを表示
+  -n, --novelai-dir <NAME>       NovelAI用フォルダ名 (デフォルト: NovelAI_img)
+  -s, --swarm-dir-name <NAME>    SwarmUI用フォルダ名 (デフォルト: SwarmUI_img)
+  -i, --invoke-dir-name <NAME>   InvokeAI用フォルダ名 (デフォルト: InvokeAI_img)
+      --copy                     ファイルを移動せず、コピーする
+  -h, --help                     ヘルプを表示
+  -V, --version                  バージョンを表示 (2.0.0)
 ```
+
+整理先フォルダ名を変更した場合も、次回実行時の走査からそのフォルダは除外されます。
 
 ### 実行例
 
@@ -102,6 +107,10 @@ C:\Images\
   │     └── 002.png
   ├── NovelAI_img\
   │     └── 004.png  (NovelAI製)
+  ├── SwarmUI_img\
+  │     └── 005.png  (SwarmUI製)
+  ├── InvokeAI_img\
+  │     └── 006.png  (InvokeAI製)
   ├── 003.jpg  (そのまま)
 ```
 
