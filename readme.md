@@ -70,12 +70,12 @@ Arguments:
 Options:
   -c, --comfy-dir-name <NAME>    ComfyUI用フォルダ名 (デフォルト: comfyui_img)
   -w, --webui-dir-name <NAME>    WebUI用フォルダ名 (デフォルト: webui_img)
-  -n, --novelai-dir <NAME>       NovelAI用フォルダ名 (デフォルト: NovelAI_img)
+  -n, --novelai-dir-name <NAME>  NovelAI用フォルダ名 (デフォルト: NovelAI_img)
   -s, --swarm-dir-name <NAME>    SwarmUI用フォルダ名 (デフォルト: SwarmUI_img)
   -i, --invoke-dir-name <NAME>   InvokeAI用フォルダ名 (デフォルト: InvokeAI_img)
       --copy                     ファイルを移動せず、コピーする
   -h, --help                     ヘルプを表示
-  -V, --version                  バージョンを表示 (2.0.1)
+  -V, --version                  バージョンを表示 (2.0.1b)
 ```
 
 整理先フォルダ名を変更した場合も、次回実行時の走査からそのフォルダは除外されます。

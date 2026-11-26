@@ -11,7 +11,7 @@ use std::sync::Mutex;
 const LEGACY_WEBUI_OUTPUT_DIR_NAME: &str = "webui_image";
 
 #[derive(Parser)]
-#[command(name = "sd_meta_sorter", version)]
+#[command(name = "sd_meta_sorter", version = "2.0.1b")]
 struct Args {
     #[arg(required = true)]
     inputs: Vec<String>,
@@ -22,7 +22,12 @@ struct Args {
     #[arg(short = 'w', long, default_value = "webui_img")]
     webui_dir_name: String,
 
-    #[arg(short = 'n', long = "novelai-dir", default_value = "NovelAI_img")]
+    #[arg(
+        short = 'n',
+        long = "novelai-dir-name",
+        alias = "novelai-dir",
+        default_value = "NovelAI_img"
+    )]
     novelai_dir_name: String,
 
     #[arg(short = 's', long = "swarm-dir-name", default_value = "SwarmUI_img")]

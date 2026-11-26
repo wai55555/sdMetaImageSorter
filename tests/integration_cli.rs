@@ -165,3 +165,50 @@ fn migrates_legacy_webui_directory_without_rescanning_it() {
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(stdout.contains("Found 0 images"), "{stdout}");
 }
+
+#[test]
+fn novelai_option_long_name_and_legacy_alias_work() {
+    for (option, folder) in [
+        ("--novelai-dir-name", "NewNovel"),
+        ("--novelai-dir", "OldNovel"),
+    ] {
+        let dir = TempDir::new();
+        write_png(
+            &dir.path,
+            "novelai.png",
+            &[text_chunk("Comment", "{\"steps\":20}")],
+        );
+        let output = Command::new(env!("CARGO_BIN_EXE_sd_meta_sorter"))
+            .arg(&dir.path)
+            .args([option, folder])
+            .output()
+            .expect("run sd_meta_sorter");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(dir.path.join(folder).join("novelai.png").is_file());
+    }
+}
+
+#[test]
+fn help_and_version_use_the_unified_option_and_2_0_1b() {
+    let help = Command::new(env!("CARGO_BIN_EXE_sd_meta_sorter"))
+        .arg("--help")
+        .output()
+        .expect("run sd_meta_sorter --help");
+    assert!(help.status.success());
+    let help = String::from_utf8(help.stdout).unwrap();
+    assert!(help.contains("--novelai-dir-name"), "{help}");
+
+    let version = Command::new(env!("CARGO_BIN_EXE_sd_meta_sorter"))
+        .arg("--version")
+        .output()
+        .expect("run sd_meta_sorter --version");
+    assert!(version.status.success());
+    assert_eq!(
+        String::from_utf8(version.stdout).unwrap().trim(),
+        "sd_meta_sorter 2.0.1b"
+    );
+}
