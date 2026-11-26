@@ -147,3 +147,21 @@ fn sorts_into_five_custom_folders_and_excludes_them_on_rerun() {
     let rerun_stdout = String::from_utf8(rerun.stdout).unwrap();
     assert!(rerun_stdout.contains("Found 0 images"), "{rerun_stdout}");
 }
+
+#[test]
+fn migrates_legacy_webui_directory_without_rescanning_it() {
+    let dir = TempDir::new();
+    fs::create_dir_all(dir.path.join("webui_image")).unwrap();
+    fs::write(dir.path.join("webui_image/legacy.png"), b"legacy").unwrap();
+
+    let output = run(&dir.path);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(dir.path.join("CustomWebui/legacy.png").is_file());
+    assert!(!dir.path.join("webui_image").exists());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("Found 0 images"), "{stdout}");
+}

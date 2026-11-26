@@ -75,7 +75,7 @@ Options:
   -i, --invoke-dir-name <NAME>   InvokeAI用フォルダ名 (デフォルト: InvokeAI_img)
       --copy                     ファイルを移動せず、コピーする
   -h, --help                     ヘルプを表示
-  -V, --version                  バージョンを表示 (2.0.0)
+  -V, --version                  バージョンを表示 (2.0.1)
 ```
 
 整理先フォルダ名を変更した場合も、次回実行時の走査からそのフォルダは除外されます。

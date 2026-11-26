@@ -1,11 +1,12 @@
 use clap::Parser;
 use fast_meta::{RecordSink, RecordView, Source};
 use rayon::prelude::*;
+use std::collections::HashSet;
 use std::fs;
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use walkdir::WalkDir;
+use std::sync::Mutex;
 
 const LEGACY_WEBUI_OUTPUT_DIR_NAME: &str = "webui_image";
 
@@ -67,32 +68,15 @@ fn main() {
     }
 
     let mut target_files = Vec::new();
-    let supported_extensions = ["png", "jpg", "jpeg", "webp", "avif"];
 
     println!("Scanning inputs (migrating old output folders first)...");
-    
+
+    // 走査と旧フォルダ移行を同じ再帰走査で行い、ディレクトリツリーを二度歩かない。
     for path in &scan_inputs {
         if path.is_dir() {
-            // ★修正箇所: .into_iter() を追加しました
-            let walker = WalkDir::new(path).into_iter().filter_entry(|entry| {
-                if entry.file_type().is_dir() {
-                    let name = entry.file_name().to_string_lossy();
-                    if is_current_output_name(&name, &args) || legacy_target_name(&name, &args).is_some() {
-                        return false;
-                    }
-                }
-                true
-            });
-
-            for entry in walker.filter_map(|e| e.ok()) {
-                if entry.file_type().is_file() {
-                    if let Some(ext) = entry.path().extension() {
-                        let ext_str = ext.to_string_lossy().to_lowercase();
-                        if supported_extensions.contains(&ext_str.as_str()) {
-                            target_files.push(entry.path().to_path_buf());
-                        }
-                    }
-                }
+            if let Err(e) = collect_directory_images(path, &args, &mut target_files) {
+                eprintln!("[ERROR] Failed to scan input {:?}: {}", path, e);
+                std::process::exit(1);
             }
         } else if path.is_file() {
             target_files.push(path.to_path_buf());
@@ -102,8 +86,9 @@ fn main() {
     let total = target_files.len();
     println!("Found {} images. Processing...", total);
 
+    let created_dirs = DirectoryCache::default();
     target_files.par_iter().for_each(|file_path| {
-        match process_image(file_path, &args) {
+        match process_image(file_path, &args, &created_dirs) {
             Ok(TargetType::ComfyUI) => { count_comfy.fetch_add(1, Ordering::Relaxed); },
             Ok(TargetType::WebUI) => { count_webui.fetch_add(1, Ordering::Relaxed); },
             Ok(TargetType::NovelAI) => { count_novelai.fetch_add(1, Ordering::Relaxed); },
@@ -132,6 +117,68 @@ fn main() {
     }
 }
 
+
+fn is_supported_image_path(path: &Path) -> bool {
+    path.extension().is_some_and(|extension| {
+        let extension = extension.to_string_lossy();
+        ["png", "jpg", "jpeg", "webp", "avif"]
+            .iter()
+            .any(|supported| extension.eq_ignore_ascii_case(supported))
+    })
+}
+
+/// 1 回の再帰走査で、旧 `webui_image` の移行と画像ファイルの収集を行う。
+/// 出力フォルダと旧出力フォルダの配下は走査しない。
+fn collect_directory_images(
+    dir: &Path,
+    args: &Args,
+    target_files: &mut Vec<PathBuf>,
+) -> Result<(), String> {
+    if let Some(name) = dir.file_name().map(|name| name.to_string_lossy()) {
+        if let Some(target_name) = legacy_target_name(&name, args) {
+            if !name.eq_ignore_ascii_case(target_name) {
+                let parent = dir.parent().ok_or("Legacy output folder has no parent")?;
+                migrate_legacy_directory(dir, &parent.join(target_name))?;
+                return Ok(());
+            }
+        }
+        if is_current_output_name(&name, args) {
+            return Ok(());
+        }
+    }
+
+    let entries = fs::read_dir(dir).map_err(|e| format!("Read directory {:?} failed: {}", dir, e))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("Read directory entry in {:?} failed: {}", dir, e))?;
+        let path = entry.path();
+        let file_type = entry
+            .file_type()
+            .map_err(|e| format!("Read file type for {:?} failed: {}", path, e))?;
+        if file_type.is_dir() {
+            collect_directory_images(&path, args, target_files)?;
+        } else if file_type.is_file() && is_supported_image_path(&path) {
+            target_files.push(path);
+        }
+    }
+    Ok(())
+}
+
+/// 同じ整理先フォルダへの `create_dir_all` を 1 回に集約する。
+#[derive(Default)]
+struct DirectoryCache {
+    created: Mutex<HashSet<PathBuf>>,
+}
+
+impl DirectoryCache {
+    fn ensure(&self, path: &Path) -> Result<(), String> {
+        if self.created.lock().unwrap().contains(path) {
+            return Ok(());
+        }
+        fs::create_dir_all(path).map_err(|e| format!("Create dir failed: {}", e))?;
+        self.created.lock().unwrap().insert(path.to_path_buf());
+        Ok(())
+    }
+}
 
 fn legacy_target_name<'a>(name: &str, args: &'a Args) -> Option<&'a str> {
     if name.eq_ignore_ascii_case(LEGACY_WEBUI_OUTPUT_DIR_NAME) {
@@ -165,7 +212,6 @@ fn prepare_input_path(path: &Path, args: &Args) -> Result<std::path::PathBuf, St
                 return Ok(path.to_path_buf());
             }
         }
-        migrate_legacy_output_dirs(path, args)?;
         return Ok(path.to_path_buf());
     }
 
@@ -339,7 +385,11 @@ fn legacy_conflict_path(parent: &Path, name: &std::ffi::OsStr, index: usize) -> 
     }
 }
 
-fn process_image(file_path: &Path, args: &Args) -> Result<TargetType, String> {
+fn process_image(
+    file_path: &Path,
+    args: &Args,
+    created_dirs: &DirectoryCache,
+) -> Result<TargetType, String> {
     let mut sink = ClassifierSink::default();
     // 子プロセス時代の隔離性を、ファイル単位の catch_unwind で代替する。
     let scan_result = catch_unwind(AssertUnwindSafe(|| {
@@ -372,9 +422,7 @@ fn process_image(file_path: &Path, args: &Args) -> Result<TargetType, String> {
     // 親ディレクトリ内にフォルダを作成
     let dest_dir = parent_dir.join(folder_name);
 
-    if let Err(e) = fs::create_dir_all(&dest_dir) {
-        return Err(format!("Create dir failed: {}", e));
-    }
+    created_dirs.ensure(&dest_dir)?;
 
     let file_name = file_path.file_name().ok_or("Cannot get file name")?;
     let dest_path = dest_dir.join(file_name);
@@ -705,6 +753,60 @@ mod tests {
             sink.on_record(record);
         }
         sink.decide().unwrap_or(TargetType::None)
+    }
+
+    fn default_args() -> Args {
+        Args {
+            inputs: Vec::new(),
+            comfy_dir_name: "comfyui_img".to_string(),
+            webui_dir_name: "webui_img".to_string(),
+            novelai_dir_name: "NovelAI_img".to_string(),
+            swarm_dir_name: "SwarmUI_img".to_string(),
+            invoke_dir_name: "InvokeAI_img".to_string(),
+            copy: false,
+        }
+    }
+
+    #[test]
+    fn collects_images_and_migrates_legacy_directory_in_one_pass() {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "sd-sorter-scan-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(root.join("batch")).unwrap();
+        fs::create_dir_all(root.join("webui_image")).unwrap();
+        fs::create_dir_all(root.join("comfyui_img")).unwrap();
+        fs::write(root.join("batch/a.png"), b"a").unwrap();
+        fs::write(root.join("batch/note.txt"), b"note").unwrap();
+        fs::write(root.join("webui_image/b.png"), b"b").unwrap();
+        fs::write(root.join("comfyui_img/c.png"), b"c").unwrap();
+
+        let args = default_args();
+        let mut files = Vec::new();
+        collect_directory_images(&root, &args, &mut files).unwrap();
+
+        assert_eq!(files, vec![root.join("batch/a.png")]);
+        assert!(!root.join("webui_image").exists());
+        assert!(root.join("webui_img/b.png").is_file());
+        assert!(root.join("comfyui_img/c.png").is_file());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn directory_cache_is_idempotent() {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "sd-sorter-cache-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let cache = DirectoryCache::default();
+        cache.ensure(&path).unwrap();
+        cache.ensure(&path).unwrap();
+        assert!(path.is_dir());
+        fs::remove_dir_all(path).unwrap();
     }
 
     #[test]
