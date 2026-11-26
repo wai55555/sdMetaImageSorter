@@ -1,16 +1,16 @@
 use clap::Parser;
+use fast_meta::{RecordSink, RecordView, Source};
 use rayon::prelude::*;
 use std::fs;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::Path;
-use std::process::{Command, Stdio};
-use std::env;
-use walkdir::WalkDir;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use walkdir::WalkDir;
 
 const LEGACY_WEBUI_OUTPUT_DIR_NAME: &str = "webui_image";
 
 #[derive(Parser)]
-#[command(name = "sd_meta_sorter", version = "4.4")]
+#[command(name = "sd_meta_sorter", version)]
 struct Args {
     #[arg(required = true)]
     inputs: Vec<String>,
@@ -24,15 +24,23 @@ struct Args {
     #[arg(short = 'n', long = "novelai-dir", default_value = "NovelAI_img")]
     novelai_dir_name: String,
 
+    #[arg(short = 's', long = "swarm-dir-name", default_value = "SwarmUI_img")]
+    swarm_dir_name: String,
+
+    #[arg(short = 'i', long = "invoke-dir-name", default_value = "InvokeAI_img")]
+    invoke_dir_name: String,
+
     #[arg(long)]
     copy: bool,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TargetType {
     ComfyUI,
     WebUI,
     NovelAI,
+    SwarmUI,
+    InvokeAI,
     None,
 }
 
@@ -42,17 +50,10 @@ fn main() {
     let count_comfy = AtomicUsize::new(0);
     let count_webui = AtomicUsize::new(0);
     let count_novelai = AtomicUsize::new(0);
+    let count_swarm = AtomicUsize::new(0);
+    let count_invoke = AtomicUsize::new(0);
     let count_skip = AtomicUsize::new(0);
     let count_error = AtomicUsize::new(0);
-
-    let exe_path = env::current_exe().unwrap_or_default();
-    let exe_dir = exe_path.parent().unwrap_or(Path::new("."));
-    let fast_meta_path = exe_dir.join("fast_meta.exe");
-
-    if !fast_meta_path.exists() {
-        eprintln!("[ERROR] fast_meta.exe not found at {:?}", fast_meta_path);
-        std::process::exit(1);
-    }
 
     let mut scan_inputs = Vec::with_capacity(args.inputs.len());
     for input in &args.inputs {
@@ -102,10 +103,12 @@ fn main() {
     println!("Found {} images. Processing...", total);
 
     target_files.par_iter().for_each(|file_path| {
-        match process_image(file_path, &args, &fast_meta_path) {
+        match process_image(file_path, &args) {
             Ok(TargetType::ComfyUI) => { count_comfy.fetch_add(1, Ordering::Relaxed); },
             Ok(TargetType::WebUI) => { count_webui.fetch_add(1, Ordering::Relaxed); },
             Ok(TargetType::NovelAI) => { count_novelai.fetch_add(1, Ordering::Relaxed); },
+            Ok(TargetType::SwarmUI) => { count_swarm.fetch_add(1, Ordering::Relaxed); },
+            Ok(TargetType::InvokeAI) => { count_invoke.fetch_add(1, Ordering::Relaxed); },
             Ok(TargetType::None) => { count_skip.fetch_add(1, Ordering::Relaxed); },
             Err(e) => {
                 eprintln!("[ERROR] {:?}: {}", file_path, e);
@@ -119,6 +122,8 @@ fn main() {
     println!("  -> ComfyUI: {}", count_comfy.load(Ordering::Relaxed));
     println!("  -> WebUI: {}", count_webui.load(Ordering::Relaxed));
     println!("  -> NovelAI: {}", count_novelai.load(Ordering::Relaxed));
+    println!("  -> SwarmUI: {}", count_swarm.load(Ordering::Relaxed));
+    println!("  -> InvokeAI: {}", count_invoke.load(Ordering::Relaxed));
     println!("  -> Skipped: {}", count_skip.load(Ordering::Relaxed));
     println!("  -> Errors: {}", count_error.load(Ordering::Relaxed));
     println!("--------------------------------------------------");
@@ -139,7 +144,9 @@ fn legacy_target_name<'a>(name: &str, args: &'a Args) -> Option<&'a str> {
 fn is_current_output_name(name: &str, args: &Args) -> bool {
     name.eq_ignore_ascii_case(&args.comfy_dir_name) ||
     name.eq_ignore_ascii_case(&args.webui_dir_name) ||
-    name.eq_ignore_ascii_case(&args.novelai_dir_name)
+    name.eq_ignore_ascii_case(&args.novelai_dir_name) ||
+    name.eq_ignore_ascii_case(&args.swarm_dir_name) ||
+    name.eq_ignore_ascii_case(&args.invoke_dir_name)
 }
 
 fn prepare_input_path(path: &Path, args: &Args) -> Result<std::path::PathBuf, String> {
@@ -332,38 +339,39 @@ fn legacy_conflict_path(parent: &Path, name: &std::ffi::OsStr, index: usize) -> 
     }
 }
 
-fn process_image(file_path: &Path, args: &Args, fast_meta_path: &Path) -> Result<TargetType, String> {
-    let mut cmd = Command::new(fast_meta_path);
-    cmd.arg(file_path);
-    cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::piped());
+fn process_image(file_path: &Path, args: &Args) -> Result<TargetType, String> {
+    let mut sink = ClassifierSink::default();
+    // 子プロセス時代の隔離性を、ファイル単位の catch_unwind で代替する。
+    let scan_result = catch_unwind(AssertUnwindSafe(|| {
+        fast_meta::scan_file(
+            file_path,
+            &fast_meta::ScanOptions::default(),
+            &mut sink,
+        )
+    }))
+    .map_err(|_| "scan panicked".to_string())?;
+    scan_result.map_err(|error| error.to_string())?;
 
-    let output = cmd.output().map_err(|e| format!("Exec failed: {}", e))?;
-    
-    if !output.status.success() {
-        return Err(format!("Metadata extraction failed ({}): {}", output.status, String::from_utf8_lossy(&output.stderr).trim()));
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let target = classify_metadata(&stdout);
-
+    let target = sink.decide().unwrap_or(TargetType::None);
     if target == TargetType::None {
         return Ok(TargetType::None);
     }
 
     // 親ディレクトリ取得
     let parent_dir = file_path.parent().ok_or("Cannot get parent dir")?;
-    
+
     let folder_name = match target {
         TargetType::ComfyUI => &args.comfy_dir_name,
         TargetType::WebUI => &args.webui_dir_name,
         TargetType::NovelAI => &args.novelai_dir_name,
-        _ => unreachable!(),
+        TargetType::SwarmUI => &args.swarm_dir_name,
+        TargetType::InvokeAI => &args.invoke_dir_name,
+        TargetType::None => unreachable!(),
     };
 
     // 親ディレクトリ内にフォルダを作成
     let dest_dir = parent_dir.join(folder_name);
-    
+
     if let Err(e) = fs::create_dir_all(&dest_dir) {
         return Err(format!("Create dir failed: {}", e));
     }
@@ -375,7 +383,6 @@ fn process_image(file_path: &Path, args: &Args, fast_meta_path: &Path) -> Result
     } else {
         Ok(TargetType::None)
     }
-
 }
 
 // Hard links provide an atomic no-replace move on the same filesystem. If unavailable,
@@ -415,26 +422,214 @@ fn transfer_no_replace(source: &Path, dest: &Path, copy: bool) -> Result<bool, S
     Ok(true)
 }
 
-// The first line contains the input path, not metadata.
-fn classify_metadata(output: &str) -> TargetType {
-    let metadata = output.lines().skip(1).collect::<Vec<_>>().join("\n");
-    let normalized = metadata.to_ascii_lowercase();
+#[derive(Default)]
+struct KeywordFlags {
+    comment: bool,
+    sui_image_params: bool,
+    sui_extra_data: bool,
+    invokeai_metadata: bool,
+    sd_metadata: bool,
+    dream: bool,
+    use_stable_diffusion_model: bool,
+    workflow: bool,
+    generation_data: bool,
+    prompt: bool,
+    parameters: bool,
+}
 
-    // Prefer format headers over words in free-text prompts or stealth payloads.
-    if metadata.contains("--- NovelAI [") {
-        TargetType::NovelAI
-    } else if metadata.contains("--- workflow ---") ||
-              metadata.contains("--- generation_data ---") ||
-              metadata.contains("--- prompt ---") {
-        TargetType::ComfyUI
-    } else if normalized.contains("novelai") {
-        TargetType::NovelAI
-    } else if metadata.contains("parameters") || metadata.contains("Stable Diffusion") ||
-              metadata.contains("Software") || metadata.contains("Steps: ") ||
-              metadata.contains("--- Stealth PNG Info (") {
-        TargetType::WebUI
-    } else {
-        TargetType::None
+impl KeywordFlags {
+    fn observe(&mut self, keyword: &str) {
+        match keyword {
+            "Comment" => self.comment = true,
+            "sui_image_params" => self.sui_image_params = true,
+            "sui_extra_data" => self.sui_extra_data = true,
+            "invokeai_metadata" => self.invokeai_metadata = true,
+            "sd-metadata" => self.sd_metadata = true,
+            "Dream" => self.dream = true,
+            "use_stable_diffusion_model" => self.use_stable_diffusion_model = true,
+            "workflow" => self.workflow = true,
+            "generation_data" => self.generation_data = true,
+            "prompt" => self.prompt = true,
+            "parameters" => self.parameters = true,
+            _ => {}
+        }
+    }
+}
+
+fn limited_bytes(text: &str, limit: usize) -> &[u8] {
+    let bytes = text.as_bytes();
+    &bytes[..bytes.len().min(limit)]
+}
+
+fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    needle.is_empty() || haystack.windows(needle.len()).any(|window| window == needle)
+}
+
+fn contains_ignore_ascii_case(haystack: &str, needle: &[u8]) -> bool {
+    let haystack = haystack.as_bytes();
+    needle.is_empty()
+        || haystack
+            .windows(needle.len())
+            .any(|window| window.eq_ignore_ascii_case(needle))
+}
+
+/// §8.2 のシグナルだけを収集する。本文の全文コピーや小文字化コピーは作らない。
+#[derive(Default)]
+struct ClassifierSink {
+    keywords: KeywordFlags,
+    trailing_novelai: bool,
+    trailing_webui: bool,
+    has_software: bool,
+    software_bodies: Vec<String>,
+    model_body_has_sui: bool,
+    parameters_has_sui: bool,
+    prompt_is_json: bool,
+    usercomment_has_workflow: bool,
+    usercomment_is_novelai_pack: bool,
+    steps_in_text_fields: bool,
+    jpeg_comment_a1111: bool,
+    has_stealth: bool,
+    stealth_novelai: bool,
+    stealth_comfy: bool,
+    has_xmp: bool,
+}
+
+impl RecordSink for ClassifierSink {
+    fn on_record(&mut self, record: &RecordView<'_>) {
+        // §8.2 包括規則: Trailing は trailing 系シグナル以外に効かせない。
+        if record.source == Source::Trailing {
+            if contains_ignore_ascii_case(&record.body, b"novelai") {
+                self.trailing_novelai = true;
+            }
+            if ["parameters", "Stable Diffusion", "Software", "Steps: "]
+                .iter()
+                .any(|needle| record.body.contains(needle))
+            {
+                self.trailing_webui = true;
+            }
+            return;
+        }
+
+        if let Some(keyword) = record.keyword.as_deref() {
+            self.keywords.observe(keyword);
+            match keyword {
+                "Software" => {
+                    self.has_software = true;
+                    if record.body.len() <= 256 {
+                        self.software_bodies.push(record.body.to_string());
+                    }
+                }
+                "Model" => {
+                    if record.body.contains("sui_image_params") {
+                        self.model_body_has_sui = true;
+                    }
+                }
+                "parameters" => {
+                    if record.body.contains("\"sui_image_params\"") {
+                        self.parameters_has_sui = true;
+                    }
+                }
+                "prompt" => {
+                    if record.body.trim_start().starts_with('{') {
+                        self.prompt_is_json = true;
+                    }
+                }
+                "UserComment" => {
+                    let body = limited_bytes(&record.body, 64 * 1024);
+                    if contains_bytes(body, b"\"workflow\"") {
+                        self.usercomment_has_workflow = true;
+                    }
+                    if contains_bytes(body, b"\"Comment\":")
+                        && contains_bytes(body, b"\"Description\":")
+                    {
+                        self.usercomment_is_novelai_pack = true;
+                    }
+                }
+                _ => {}
+            }
+            if keyword == "UserComment" || keyword == "ImageDescription" {
+                if contains_bytes(limited_bytes(&record.body, 64 * 1024), b"Steps: ") {
+                    self.steps_in_text_fields = true;
+                }
+            }
+        }
+
+        if record.source == Source::JpegComment
+            && record.label == "Stable Diffusion (A1111)"
+        {
+            self.jpeg_comment_a1111 = true;
+        }
+        if record.source == Source::PngStealth {
+            self.has_stealth = true;
+            if contains_ignore_ascii_case(&record.body, b"novelai") {
+                self.stealth_novelai = true;
+            }
+            if contains_ignore_ascii_case(&record.body, b"workflow") {
+                self.stealth_comfy = true;
+            }
+        }
+        if matches!(
+            record.source,
+            Source::PngXmp | Source::JpegXmp | Source::WebpXmp | Source::TiffXmp
+        ) {
+            self.has_xmp = true;
+        }
+    }
+}
+
+impl ClassifierSink {
+    /// §8.3 の決定手順。上が優先。
+    fn decide(&self) -> Option<TargetType> {
+        // 1. NovelAI の見出し相当（FR-CLS-01: Description 単独では確定しない）
+        if self.keywords.comment {
+            return Some(TargetType::NovelAI);
+        }
+        // 2. SwarmUI（F-07）
+        if self.keywords.sui_image_params
+            || self.keywords.sui_extra_data
+            || self.parameters_has_sui
+            || self.model_body_has_sui
+        {
+            return Some(TargetType::SwarmUI);
+        }
+        // 3. InvokeAI（F-04 / F-05）
+        if self.keywords.invokeai_metadata || self.keywords.sd_metadata || self.keywords.dream {
+            return Some(TargetType::InvokeAI);
+        }
+        // 4. Easy Diffusion（F-06）→ WebUI キャッチオール
+        if self.keywords.use_stable_diffusion_model {
+            return Some(TargetType::WebUI);
+        }
+        // 5. ComfyUI（FR-CLS-02 / FR-CLS-07）
+        if self.keywords.workflow
+            || self.keywords.generation_data
+            || (self.keywords.prompt && self.prompt_is_json)
+            || self.usercomment_has_workflow
+            || self.stealth_comfy
+        {
+            return Some(TargetType::ComfyUI);
+        }
+        // 5b. 本文由来の NovelAI（旧順序: Comfy 見出し相当 → novelai 本文 → WebUI 本文）
+        if self.software_bodies.iter().any(|body| body.contains("NovelAI"))
+            || self.usercomment_is_novelai_pack
+            || self.stealth_novelai
+            || self.trailing_novelai
+        {
+            return Some(TargetType::NovelAI);
+        }
+        // 6. WebUI（A1111 / 汎用キャッチオール、FR-CLS-04 / FR-CLS-05）
+        if self.keywords.parameters
+            || self.steps_in_text_fields
+            || self.jpeg_comment_a1111
+            || self.has_software
+            || self.has_stealth
+            || self.has_xmp
+            || self.trailing_webui
+        {
+            return Some(TargetType::WebUI);
+        }
+        // 7. どれにも当たらない
+        None
     }
 }
 
@@ -487,18 +682,323 @@ mod tests {
         fs::remove_dir_all(dir).unwrap();
     }
 
+    use std::borrow::Cow;
+
+    fn record(
+        source: Source,
+        label: &'static str,
+        body: &'static str,
+        keyword: Option<&'static str>,
+    ) -> RecordView<'static> {
+        RecordView {
+            source,
+            label: Cow::Borrowed(label),
+            body: Cow::Borrowed(body),
+            keyword: keyword.map(Cow::Borrowed),
+            detail: None,
+        }
+    }
+
+    fn classify(records: &[RecordView<'static>]) -> TargetType {
+        let mut sink = ClassifierSink::default();
+        for record in records {
+            sink.on_record(record);
+        }
+        sink.decide().unwrap_or(TargetType::None)
+    }
+
     #[test]
     fn classifies_novelai_before_generic_metadata() {
-        assert_eq!(classify_metadata("=== PNG File: x.png ===\n--- NovelAI [Settings] ---\n{\"steps\": 28}"), TargetType::NovelAI);
-        assert_eq!(classify_metadata("=== PNG File: x.png ===\n--- Stealth PNG Info (Alpha) [stealth_pnginfo] ---\n{\"Software\":\"NovelAI\"}"), TargetType::NovelAI);
-        assert_eq!(classify_metadata("=== PNG File: x.png ===\n--- Stable Diffusion (A1111) ---\nSteps: 20"), TargetType::WebUI);
+        assert_eq!(
+            classify(&[
+                record(Source::PngText, "NovelAI [Settings]", "{\"steps\": 28}", Some("Comment")),
+                record(
+                    Source::PngText,
+                    "Stable Diffusion (A1111)",
+                    "Steps: 20",
+                    Some("parameters")
+                ),
+            ]),
+            TargetType::NovelAI
+        );
+        assert_eq!(
+            classify(&[record(
+                Source::PngStealth,
+                "Stealth PNG Info (Alpha) [stealth_pnginfo]",
+                "{\"Software\":\"NovelAI\"}",
+                None
+            )]),
+            TargetType::NovelAI
+        );
+        assert_eq!(
+            classify(&[record(
+                Source::PngText,
+                "Stable Diffusion (A1111)",
+                "Steps: 20",
+                Some("parameters")
+            )]),
+            TargetType::WebUI
+        );
     }
 
     #[test]
     fn classifies_stealth_and_ignores_the_input_path() {
-        assert_eq!(classify_metadata("=== PNG File: NovelAI-workflow.png ===\n(No metadata detected)"), TargetType::None);
-        assert_eq!(classify_metadata("=== PNG File: x.png ===\n--- Stealth PNG Info (Alpha) [stealth_pnginfo] ---\nopaque data"), TargetType::WebUI);
-        assert_eq!(classify_metadata("=== PNG File: x.png ===\n--- Stealth PNG Info (RGB) [stealth_rgbcomp] ---\nComfyUI workflow"), TargetType::ComfyUI);
-        assert_eq!(classify_metadata("=== PNG File: x.png ===\n--- workflow ---\n{}"), TargetType::ComfyUI);
+        assert_eq!(classify(&[]), TargetType::None);
+        assert_eq!(
+            classify(&[record(
+                Source::PngStealth,
+                "Stealth PNG Info (Alpha) [stealth_pnginfo]",
+                "opaque data",
+                None
+            )]),
+            TargetType::WebUI
+        );
+        assert_eq!(
+            classify(&[record(
+                Source::PngStealth,
+                "Stealth PNG Info (RGB) [stealth_rgbcomp]",
+                "ComfyUI workflow",
+                None
+            )]),
+            TargetType::ComfyUI
+        );
+        assert_eq!(
+            classify(&[record(Source::PngText, "workflow", "{}", Some("workflow"))]),
+            TargetType::ComfyUI
+        );
     }
+
+    #[test]
+    fn classifies_swarmui_variants() {
+        assert_eq!(
+            classify(&[record(
+                Source::PngText,
+                "SwarmUI [Params]",
+                "{\"prompt\":\"cat\"}",
+                Some("sui_image_params")
+            )]),
+            TargetType::SwarmUI
+        );
+        assert_eq!(
+            classify(&[record(
+                Source::PngText,
+                "SwarmUI [Extra]",
+                "{}",
+                Some("sui_extra_data")
+            )]),
+            TargetType::SwarmUI
+        );
+        assert_eq!(
+            classify(&[record(
+                Source::PngText,
+                "Stable Diffusion (A1111)",
+                "{\"sui_image_params\":{\"prompt\":\"cat\"}}",
+                Some("parameters")
+            )]),
+            TargetType::SwarmUI
+        );
+        assert_eq!(
+            classify(&[record(
+                Source::JpegExif,
+                "EXIF Model",
+                "{\"sui_image_params\":{\"prompt\":\"cat\"}}",
+                Some("Model")
+            )]),
+            TargetType::SwarmUI
+        );
+    }
+
+    #[test]
+    fn classifies_invokeai_keys_as_invokeai() {
+        for keyword in ["invokeai_metadata", "sd-metadata", "Dream"] {
+            assert_eq!(
+                classify(&[record(
+                    Source::PngText,
+                    "InvokeAI",
+                    "{\"prompt\":\"cat\"}",
+                    Some(keyword)
+                )]),
+                TargetType::InvokeAI
+            );
+        }
+    }
+
+    #[test]
+    fn classifies_easy_diffusion_marker_as_webui() {
+        assert_eq!(
+            classify(&[record(
+                Source::PngText,
+                "Easy Diffusion",
+                "sd_xl_base_1.0",
+                Some("use_stable_diffusion_model")
+            )]),
+            TargetType::WebUI
+        );
+    }
+
+    #[test]
+    fn description_alone_is_not_novelai() {
+        assert_eq!(
+            classify(&[record(
+                Source::PngText,
+                "NovelAI [Prompt]",
+                "a cat",
+                Some("Description")
+            )]),
+            TargetType::None
+        );
+        assert_eq!(
+            classify(&[
+                record(Source::PngText, "NovelAI [Prompt]", "a cat", Some("Description")),
+                record(Source::PngText, "Software", "Midjourney", Some("Software")),
+            ]),
+            TargetType::WebUI
+        );
+        assert_eq!(
+            classify(&[
+                record(Source::PngText, "NovelAI [Prompt]", "a cat", Some("Description")),
+                record(Source::PngText, "NovelAI [Settings]", "{}", Some("Comment")),
+            ]),
+            TargetType::NovelAI
+        );
+    }
+
+    #[test]
+    fn prompt_requires_json_to_be_comfyui() {
+        assert_eq!(
+            classify(&[record(Source::PngText, "prompt", "a plain prompt", Some("prompt"))]),
+            TargetType::None
+        );
+        assert_eq!(
+            classify(&[record(
+                Source::PngText,
+                "prompt",
+                "  {\"nodes\":[]}",
+                Some("prompt")
+            )]),
+            TargetType::ComfyUI
+        );
+    }
+
+    #[test]
+    fn xmp_only_is_webui_catchall() {
+        for source in [
+            Source::PngXmp,
+            Source::JpegXmp,
+            Source::WebpXmp,
+            Source::TiffXmp,
+        ] {
+            assert_eq!(
+                classify(&[record(source, "XMP Description", "a cat --ar 1:1", None)]),
+                TargetType::WebUI
+            );
+        }
+    }
+
+    #[test]
+    fn software_body_distinguishes_novelai_and_midjourney() {
+        assert_eq!(
+            classify(&[record(Source::PngText, "Software", "NovelAI", Some("Software"))]),
+            TargetType::NovelAI
+        );
+        assert_eq!(
+            classify(&[record(Source::PngText, "Software", "Midjourney", Some("Software"))]),
+            TargetType::WebUI
+        );
+    }
+
+    #[test]
+    fn jpeg_comment_uses_label_not_body_steps() {
+        assert_eq!(
+            classify(&[record(
+                Source::JpegComment,
+                "Stable Diffusion (A1111)",
+                "Negative prompt: blur",
+                None
+            )]),
+            TargetType::WebUI
+        );
+        assert_eq!(
+            classify(&[record(
+                Source::JpegComment,
+                "Stable Diffusion (A1111)",
+                "plain comment",
+                None
+            )]),
+            TargetType::WebUI
+        );
+        assert_eq!(
+            classify(&[record(Source::JpegComment, "JPEG Comment", "plain", None)]),
+            TargetType::None
+        );
+    }
+
+    #[test]
+    fn trailing_records_only_use_body_substring_rules() {
+        assert_eq!(
+            classify(&[record(Source::Trailing, "Trailing Data (after IEND)", "novelai", None)]),
+            TargetType::NovelAI
+        );
+        assert_eq!(
+            classify(&[record(
+                Source::Trailing,
+                "Trailing Data (after IEND)",
+                "Steps: 20",
+                None
+            )]),
+            TargetType::WebUI
+        );
+        assert_eq!(
+            classify(&[record(
+                Source::Trailing,
+                "Trailing Data (after IEND)",
+                "{}",
+                Some("workflow")
+            )]),
+            TargetType::None
+        );
+    }
+
+    #[test]
+    fn comfy_signal_wins_over_software_novelai_body() {
+        assert_eq!(
+            classify(&[
+                record(Source::PngText, "workflow", "{}", Some("workflow")),
+                record(Source::PngText, "Software", "NovelAI", Some("Software")),
+            ]),
+            TargetType::ComfyUI
+        );
+    }
+
+    #[test]
+    fn usercomment_signals_are_limited_to_known_patterns() {
+        assert_eq!(
+            classify(&[record(
+                Source::JpegExif,
+                "EXIF UserComment",
+                "{\"workflow\":{}}",
+                Some("UserComment")
+            )]),
+            TargetType::ComfyUI
+        );
+        assert_eq!(
+            classify(&[record(
+                Source::JpegExif,
+                "EXIF UserComment",
+                "{\"Comment\":\"{}\",\"Description\":\"cat\"}",
+                Some("UserComment")
+            )]),
+            TargetType::NovelAI
+        );
+        assert_eq!(
+            classify(&[record(
+                Source::JpegExif,
+                "EXIF UserComment",
+                "parameters=cat\nSteps: 20",
+                Some("UserComment")
+            )]),
+            TargetType::WebUI
+        );
+    }
+
 }
