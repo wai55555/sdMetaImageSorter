@@ -23,6 +23,10 @@ pub enum TargetType {
 /// 監査 §11-1 の列挙がそのまま初期値。非AIツール名（Adobe／Photoshop／Celsys／
 /// ImageReady／GIMP 等）は **入れない**（表に入れないことでシグナル化しない）。
 /// 表への追加は、実サンプルでそのツールが当該フィールドに自名を書くことを確認した場合に限る。
+/// REQ-INV-01: 分類に使っていない担体の棚卸しは `doc/inventory-261127.md` に固定している
+/// （EXIF Make／Artist／XPComment、IPTC Caption/Abstract、XMP title／description、
+/// PNG Title／Source 等）。これらを将来分類に使う場合は、§2.2 の強さ定義に従って
+/// 値検証を設計してから着手すること（存在だけ・汎用値だけで確定させない）。
 pub const AI_TOOL_NAMES: &[&str] = &[
     "Midjourney",
     "NovelAI",
@@ -638,6 +642,49 @@ mod tests {
                 "Stable Diffusion (A1111)",
                 "a cat\nNegative prompt: blur\nSteps: 20",
                 None
+            )]),
+            TargetType::None
+        );
+    }
+
+    /// T-14（REQ-INV-01）: 棚卸し表の担体は分類に効かない（各担体のみなら None）。
+    #[test]
+    fn t14_inventoried_carriers_do_not_classify() {
+        let cases: Vec<Vec<RecordView<'static>>> = vec![
+            vec![record(Source::JpegExif, "EXIF Make", "Canon", Some("Make"))],
+            vec![record(Source::JpegExif, "EXIF Artist", "someone", Some("Artist"))],
+            vec![record(Source::JpegExif, "EXIF XPComment", "note", Some("XPComment"))],
+            vec![record(
+                Source::JpegIptc,
+                "IPTC Caption",
+                "a caption",
+                Some("Caption/Abstract"),
+            )],
+            vec![record(Source::PngXmp, "XMP Title", "a title", Some("title"))],
+            vec![png("Title", "a title", "Title")],
+            vec![png("Source", "NovelAI Diffusion V5", "Source")],
+            vec![record(
+                Source::PngXmp,
+                "XMP Description",
+                "a cat --ar 1:1",
+                Some("description"),
+            )],
+        ];
+        for (index, records) in cases.iter().enumerate() {
+            assert_eq!(classify(records), TargetType::None, "case {index}: {records:?}");
+        }
+    }
+
+    /// T-15（REQ-INV-02）: C2PA 宣言だけを持つ画像は現行では分類されない（既知の制限）。
+    /// `Source::C2pa` は enum の予約に留まり、sorter は何もシグナル化しない。
+    #[test]
+    fn t15_c2pa_only_records_do_not_classify() {
+        assert_eq!(
+            classify(&[record(
+                Source::C2pa,
+                "C2PA Manifest",
+                r#"{"claim_generator":"test","assertions":["c2pa.actions"]}"#,
+                None,
             )]),
             TargetType::None
         );
