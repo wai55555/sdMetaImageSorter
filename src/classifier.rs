@@ -257,7 +257,9 @@ impl RecordSink for ClassifierSink {
         let body = record.body.as_ref();
 
         // H-4: Trailing は trailing 系シグナル以外に効かせない。
-        if record.source == Source::Trailing {
+        // REQ-EXT-03(b) / U-4: 接続証明の無い PNG の未証明レコード（Source::PngUnproven）も
+        // Trailing と同じ隔離に置く（本文の素性が最も弱く、単独では確定させない）。
+        if record.source == Source::Trailing || record.source == Source::PngUnproven {
             if contains_ignore_ascii_case(body, b"novelai") {
                 self.weak_novelai_trailing = true;
             }
@@ -638,6 +640,50 @@ mod tests {
                 None
             )]),
             TargetType::None
+        );
+    }
+
+    /// T-11（REQ-EXT-03(b) / U-4）: 接続証明の無い PNG の未証明レコードは
+    /// Trailing と同じ隔離に置かれ、単独では確定しない。
+    #[test]
+    fn t11_unproven_png_records_are_only_weak_evidence() {
+        // A1111 本文でも、未証明レコード単独では確定しない（trailing_weak 1 票のみ）。
+        assert_eq!(
+            classify(&[record(
+                Source::PngUnproven,
+                "Stable Diffusion (A1111)",
+                "a cat\nNegative prompt: blur\nSteps: 20",
+                Some("parameters"),
+            )]),
+            TargetType::None
+        );
+        // NovelAI の語でも単独では確定しない。
+        assert_eq!(
+            classify(&[record(
+                Source::PngUnproven,
+                "Comment",
+                "novelai style",
+                Some("Comment"),
+            )]),
+            TargetType::None
+        );
+        // 他の弱シグナルと併存すれば 2 種類の複合として効く（Trailing と同じ）。
+        assert_eq!(
+            classify(&[
+                record(
+                    Source::PngUnproven,
+                    "Stable Diffusion (A1111)",
+                    "a cat\nSteps: 20",
+                    Some("parameters"),
+                ),
+                record(
+                    Source::JpegExif,
+                    "EXIF UserComment",
+                    "a cat\nNegative prompt: blur",
+                    Some("UserComment"),
+                ),
+            ]),
+            TargetType::WebUI
         );
     }
 

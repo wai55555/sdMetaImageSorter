@@ -201,7 +201,7 @@ fn novelai_option_long_name_and_legacy_alias_work() {
 }
 
 #[test]
-fn help_and_version_use_the_unified_option_and_2_1_0() {
+fn help_and_version_use_the_unified_option_and_2_2_0() {
     let help = Command::new(env!("CARGO_BIN_EXE_sd_meta_sorter"))
         .arg("--help")
         .output()
@@ -217,7 +217,7 @@ fn help_and_version_use_the_unified_option_and_2_1_0() {
     assert!(version.status.success());
     assert_eq!(
         String::from_utf8(version.stdout).unwrap().trim(),
-        "sd_meta_sorter 2.1.0"
+        "sd_meta_sorter 2.2.0"
     );
 }
 
@@ -620,4 +620,39 @@ fn t23_source_removal_failure_is_a_warning() {
     assert_eq!(output.status.code(), Some(1));
     assert!(dir.path.join("CustomWebui/a1111.png").is_file());
     assert!(source.is_file());
+}
+
+/// T-11（REQ-EXT-03(b) / U-4）: 接続証明の無い PNG（IEND 無し）から拾われた
+/// 未証明レコードは弱い証拠に留まり、単独では仕分けられない。
+#[test]
+fn unproven_png_records_do_not_sort_on_their_own() {
+    let dir = TempDir::new();
+    let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+    let mut ihdr = Vec::new();
+    ihdr.extend_from_slice(&1u32.to_be_bytes());
+    ihdr.extend_from_slice(&1u32.to_be_bytes());
+    ihdr.extend_from_slice(&[8, 6, 0, 0, 0]);
+    png.extend_from_slice(&png_chunk(b"IHDR", &ihdr));
+    png.extend_from_slice(&png_chunk(
+        b"IDAT",
+        &[120, 156, 99, 96, 0, 2, 0, 0, 5, 0, 1],
+    ));
+    png.extend_from_slice(&text_chunk(
+        "parameters",
+        "a cat\nNegative prompt: blur\nSteps: 20",
+    ));
+    // IEND を意図的に置かない（Stage C step 4 だけが回収できる）。
+    fs::write(dir.path.join("unproven.png"), png).unwrap();
+
+    let output = run(&dir.path);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("  -> WebUI: 0"), "{stdout}");
+    assert!(stdout.contains("  -> Skipped (no metadata): 1"), "{stdout}");
+    assert!(dir.path.join("unproven.png").is_file());
+    assert!(!dir.path.join("CustomWebui").exists());
 }
