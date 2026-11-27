@@ -286,3 +286,62 @@ fn positive_samples_still_sort_into_their_folders() {
     assert!(dir.path.join("CustomWebui/a1111.png").is_file());
     assert!(dir.path.join("CustomNovel/novelai.png").is_file());
 }
+
+fn jpeg_with_comment(text: &str) -> Vec<u8> {
+    let mut jpeg = b"\xff\xd8".to_vec();
+    jpeg.extend_from_slice(&[0xff, 0xfe]);
+    jpeg.extend_from_slice(&((text.len() + 2) as u16).to_be_bytes());
+    jpeg.extend_from_slice(text.as_bytes());
+    jpeg.extend_from_slice(b"\xff\xda");
+    jpeg
+}
+
+/// P-14／N-11（REQ-CLS-04）: COM の A1111 判定は構造化印で行う。
+#[test]
+fn jpeg_com_marks_decide_a1111_without_using_the_label() {
+    let dir = TempDir::new();
+    fs::write(
+        dir.path.join("both.jpg"),
+        jpeg_with_comment("a cat\nNegative prompt: blur\nSteps: 20"),
+    )
+    .unwrap();
+    fs::write(
+        dir.path.join("one.jpg"),
+        jpeg_with_comment("Steps: 20 photo comment"),
+    )
+    .unwrap();
+
+    let output = run(&dir.path);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("  -> WebUI: 1"), "{stdout}");
+    assert!(stdout.contains("  -> Skipped: 1"), "{stdout}");
+    assert!(dir.path.join("CustomWebui/both.jpg").is_file());
+    assert!(dir.path.join("one.jpg").is_file());
+}
+
+/// P-13 変種（REQ-EXT-06）: tEXt に格納された XMP パケットからも分類できる。
+#[test]
+fn xmp_packet_in_a_text_chunk_is_sorted_as_webui() {
+    let dir = TempDir::new();
+    let packet = "<x:xmpmeta xmlns:x='adobe:ns:meta/'><rdf:RDF xmlns:rdf='http://www.w3.org/1999/02/22-rdf-syntax-ns#'><rdf:Description xmlns:i='http://iptc.org/std/Iptc4xmpExt/2008-02-29/'><i:AIPromptInformation>a cat</i:AIPromptInformation></rdf:Description></rdf:RDF></x:xmpmeta>";
+    write_png(
+        &dir.path,
+        "text_xmp.png",
+        &[text_chunk("XML:com.adobe.xmp", packet)],
+    );
+
+    let output = run(&dir.path);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("  -> WebUI: 1"), "{stdout}");
+    assert!(dir.path.join("CustomWebui/text_xmp.png").is_file());
+}
