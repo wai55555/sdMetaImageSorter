@@ -160,7 +160,7 @@ fn is_dream_syntax(body: &str) -> bool {
     let Some(close) = rest.find('"') else {
         return false;
     };
-    let args = rest[close + 1..].as_bytes();
+    let args = &rest.as_bytes()[close + 1..];
     let mut flags = 0usize;
     let mut index = 0usize;
     while index < args.len() {

@@ -4,13 +4,12 @@ use std::collections::HashSet;
 use std::fs;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 const LEGACY_WEBUI_OUTPUT_DIR_NAME: &str = "webui_image";
 
 #[derive(Parser)]
-#[command(name = "sd_meta_sorter", version = "2.0.1b")]
+#[command(name = "sd_meta_sorter", version = "2.1.0")]
 struct Args {
     #[arg(required = true)]
     inputs: Vec<String>,
@@ -40,125 +39,116 @@ struct Args {
 }
 
 mod classifier;
+mod collect;
+mod report;
 
 use classifier::{ClassifierSink, TargetType};
+use collect::Collector;
+use report::{ProcessResult, Report};
 
 fn main() {
     let args = Args::parse();
 
-    let count_comfy = AtomicUsize::new(0);
-    let count_webui = AtomicUsize::new(0);
-    let count_novelai = AtomicUsize::new(0);
-    let count_swarm = AtomicUsize::new(0);
-    let count_invoke = AtomicUsize::new(0);
-    let count_skip = AtomicUsize::new(0);
-    let count_error = AtomicUsize::new(0);
-
-    let mut scan_inputs = Vec::with_capacity(args.inputs.len());
-    for input in &args.inputs {
-        match prepare_input_path(Path::new(input), &args) {
-            Ok(path) => scan_inputs.push(path),
-            Err(e) => {
-                eprintln!("[ERROR] Could not migrate existing output folders: {}", e);
-                std::process::exit(1);
-            }
-        }
+    // REQ-COL-06: 分類先フォルダ名は処理開始前に検証し、1 ファイルも移動せずに終了コード 2。
+    if let Err(message) = validate_output_folder_names(&args) {
+        eprintln!("[ERROR] Invalid output folder name: {}", message);
+        eprintln!(
+            "Usage: sd_meta_sorter <inputs...> [-c <name>] [-w <name>] [-n <name>] [-s <name>] [-i <name>] [--copy]"
+        );
+        std::process::exit(2);
     }
-
-    let mut target_files = Vec::new();
 
     println!("Scanning inputs (migrating old output folders first)...");
 
-    // 走査と旧フォルダ移行を同じ再帰走査で行い、ディレクトリツリーを二度歩かない。
-    for path in &scan_inputs {
-        if path.is_dir() {
-            if let Err(e) = collect_directory_images(path, &args, &mut target_files) {
-                eprintln!("[ERROR] Failed to scan input {:?}: {}", path, e);
-                std::process::exit(1);
-            }
-        } else if path.is_file() {
-            target_files.push(path.to_path_buf());
+    let mut collector = Collector::new(&args);
+    for input in &args.inputs {
+        let path = Path::new(input);
+        // REQ-COL-03: 存在しない入力は無言で無視せず、他の入力の処理を継続する。
+        if !path.exists() {
+            eprintln!("[WARN] Input path does not exist: {}", input);
+            collector.input_errors += 1;
+            continue;
         }
+        collector.collect_input(path);
     }
 
+    let (target_files, duplicates) = collector.finish();
     let total = target_files.len();
     println!("Found {} images. Processing...", total);
 
+    let report = Report {
+        input_errors: collector.input_errors,
+        collection_errors: collector.collection_errors,
+        excluded: collector.excluded,
+        duplicates,
+        links_followed: collector.links_followed,
+        links_skipped: collector.links_skipped,
+        ..Report::default()
+    };
+
     let created_dirs = DirectoryCache::default();
+    let unavailable_reported: Mutex<HashSet<PathBuf>> = Mutex::new(HashSet::new());
     target_files.par_iter().for_each(|file_path| {
-        match process_image(file_path, &args, &created_dirs) {
-            Ok(TargetType::ComfyUI) => { count_comfy.fetch_add(1, Ordering::Relaxed); },
-            Ok(TargetType::WebUI) => { count_webui.fetch_add(1, Ordering::Relaxed); },
-            Ok(TargetType::NovelAI) => { count_novelai.fetch_add(1, Ordering::Relaxed); },
-            Ok(TargetType::SwarmUI) => { count_swarm.fetch_add(1, Ordering::Relaxed); },
-            Ok(TargetType::InvokeAI) => { count_invoke.fetch_add(1, Ordering::Relaxed); },
-            Ok(TargetType::None) => { count_skip.fetch_add(1, Ordering::Relaxed); },
-            Err(e) => {
-                eprintln!("[ERROR] {:?}: {}", file_path, e);
-                count_error.fetch_add(1, Ordering::Relaxed);
+        match process_image(file_path, &args, &created_dirs, &unavailable_reported) {
+            Ok(result) => report.record(&result),
+            Err(error) => {
+                eprintln!("[ERROR] {:?}: {}", file_path, error);
+                report.record_error();
             }
         }
     });
 
-    println!("--------------------------------------------------");
-    println!("Total Scanned: {}", total);
-    println!("  -> ComfyUI: {}", count_comfy.load(Ordering::Relaxed));
-    println!("  -> WebUI: {}", count_webui.load(Ordering::Relaxed));
-    println!("  -> NovelAI: {}", count_novelai.load(Ordering::Relaxed));
-    println!("  -> SwarmUI: {}", count_swarm.load(Ordering::Relaxed));
-    println!("  -> InvokeAI: {}", count_invoke.load(Ordering::Relaxed));
-    println!("  -> Skipped: {}", count_skip.load(Ordering::Relaxed));
-    println!("  -> Errors: {}", count_error.load(Ordering::Relaxed));
-    println!("--------------------------------------------------");
-    if count_error.load(Ordering::Relaxed) > 0 {
+    // §12: 入力ファイル総数 ＝ 5 種の和（デバッグビルドで不変条件を確認する）。
+    debug_assert_eq!(report.accounted_files(), total, "result tally must sum to the total");
+    report.print(total);
+    if report.failed() {
         std::process::exit(1);
     }
 }
 
+/// REQ-COL-06: 分類先フォルダ名の開始前検証。
+fn validate_output_folder_names(args: &Args) -> Result<(), String> {
+    let names = [
+        ("comfy", &args.comfy_dir_name),
+        ("webui", &args.webui_dir_name),
+        ("novelai", &args.novelai_dir_name),
+        ("swarm", &args.swarm_dir_name),
+        ("invoke", &args.invoke_dir_name),
+    ];
+    for (label, name) in names {
+        if name.is_empty() {
+            return Err(format!("{}: must not be empty", label));
+        }
+        if name == "." || name == ".." {
+            return Err(format!("{}: `{}` is not a folder name", label, name));
+        }
+        if name.contains('/') || name.contains('\\') {
+            return Err(format!("{}: must not contain a path separator (`{}`)", label, name));
+        }
+        if Path::new(name).is_absolute() || name.contains(':') {
+            return Err(format!("{}: must be a relative folder name (`{}`)", label, name));
+        }
+    }
+    for (index, (label, name)) in names.iter().enumerate() {
+        for (other_label, other_name) in names.iter().skip(index + 1) {
+            if name.eq_ignore_ascii_case(other_name) {
+                return Err(format!(
+                    "{} and {} must be different folder names (`{}`)",
+                    label, other_label, name
+                ));
+            }
+        }
+    }
+    Ok(())
+}
 
-fn is_supported_image_path(path: &Path) -> bool {
+pub(crate) fn is_supported_image_path(path: &Path) -> bool {
     path.extension().is_some_and(|extension| {
         let extension = extension.to_string_lossy();
         ["png", "jpg", "jpeg", "webp", "avif"]
             .iter()
             .any(|supported| extension.eq_ignore_ascii_case(supported))
     })
-}
-
-/// 1 回の再帰走査で、旧 `webui_image` の移行と画像ファイルの収集を行う。
-/// 出力フォルダと旧出力フォルダの配下は走査しない。
-fn collect_directory_images(
-    dir: &Path,
-    args: &Args,
-    target_files: &mut Vec<PathBuf>,
-) -> Result<(), String> {
-    if let Some(name) = dir.file_name().map(|name| name.to_string_lossy()) {
-        if let Some(target_name) = legacy_target_name(&name, args) {
-            if !name.eq_ignore_ascii_case(target_name) {
-                let parent = dir.parent().ok_or("Legacy output folder has no parent")?;
-                migrate_legacy_directory(dir, &parent.join(target_name))?;
-                return Ok(());
-            }
-        }
-        if is_current_output_name(&name, args) {
-            return Ok(());
-        }
-    }
-
-    let entries = fs::read_dir(dir).map_err(|e| format!("Read directory {:?} failed: {}", dir, e))?;
-    for entry in entries {
-        let entry = entry.map_err(|e| format!("Read directory entry in {:?} failed: {}", dir, e))?;
-        let path = entry.path();
-        let file_type = entry
-            .file_type()
-            .map_err(|e| format!("Read file type for {:?} failed: {}", path, e))?;
-        if file_type.is_dir() {
-            collect_directory_images(&path, args, target_files)?;
-        } else if file_type.is_file() && is_supported_image_path(&path) {
-            target_files.push(path);
-        }
-    }
-    Ok(())
 }
 
 /// 同じ整理先フォルダへの `create_dir_all` を 1 回に集約する。
@@ -178,7 +168,7 @@ impl DirectoryCache {
     }
 }
 
-fn legacy_target_name<'a>(name: &str, args: &'a Args) -> Option<&'a str> {
+pub(crate) fn legacy_target_name<'a>(name: &str, args: &'a Args) -> Option<&'a str> {
     if name.eq_ignore_ascii_case(LEGACY_WEBUI_OUTPUT_DIR_NAME) {
         Some(&args.webui_dir_name)
     } else {
@@ -186,7 +176,7 @@ fn legacy_target_name<'a>(name: &str, args: &'a Args) -> Option<&'a str> {
     }
 }
 
-fn is_current_output_name(name: &str, args: &Args) -> bool {
+pub(crate) fn is_current_output_name(name: &str, args: &Args) -> bool {
     name.eq_ignore_ascii_case(&args.comfy_dir_name) ||
     name.eq_ignore_ascii_case(&args.webui_dir_name) ||
     name.eq_ignore_ascii_case(&args.novelai_dir_name) ||
@@ -194,215 +184,23 @@ fn is_current_output_name(name: &str, args: &Args) -> bool {
     name.eq_ignore_ascii_case(&args.invoke_dir_name)
 }
 
-fn prepare_input_path(path: &Path, args: &Args) -> Result<std::path::PathBuf, String> {
-    if path.is_dir() {
-        if let Some(name) = path.file_name().map(|name| name.to_string_lossy()) {
-            if let Some(target_name) = legacy_target_name(&name, args) {
-                if !name.eq_ignore_ascii_case(target_name) {
-                    let parent = path.parent().ok_or("Legacy output folder has no parent")?;
-                    let destination = parent.join(target_name);
-                    migrate_legacy_directory(path, &destination)?;
-                    migrate_legacy_output_dirs(parent, args)?;
-                    return Ok(destination);
-                }
-            }
-            if is_current_output_name(&name, args) {
-                return Ok(path.to_path_buf());
-            }
-        }
-        return Ok(path.to_path_buf());
-    }
-
-    if path.is_file() {
-        let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
-        let mut ancestor = Some(parent);
-        while let Some(dir) = ancestor {
-            if let Some(name) = dir.file_name().map(|name| name.to_string_lossy()) {
-                if let Some(target_name) = legacy_target_name(&name, args) {
-                    if !name.eq_ignore_ascii_case(target_name) {
-                        let old_root = dir.to_path_buf();
-                        let new_root = dir.parent().ok_or("Legacy output folder has no parent")?.join(target_name);
-                        let relative = path.strip_prefix(&old_root).map_err(|e| format!("Resolve legacy file path failed: {}", e))?;
-                        migrate_legacy_directory(&old_root, &new_root)?;
-                        if let Some(parent) = new_root.parent() {
-                            migrate_legacy_output_dirs(parent, args)?;
-                        }
-                        return Ok(new_root.join(relative));
-                    }
-                }
-            }
-            ancestor = dir.parent();
-        }
-        migrate_legacy_output_dirs(parent, args)?;
-        return Ok(path.to_path_buf());
-    }
-
-    Ok(path.to_path_buf())
-}
-
-fn migrate_legacy_output_dirs(root: &Path, args: &Args) -> Result<(), String> {
-    if let Some(name) = root.file_name().map(|name| name.to_string_lossy()) {
-        if let Some(target_name) = legacy_target_name(&name, args) {
-            if !name.eq_ignore_ascii_case(target_name) {
-                let parent = root.parent().ok_or("Legacy output folder has no parent")?;
-                return migrate_legacy_directory(root, &parent.join(target_name));
-            }
-        }
-        if is_current_output_name(&name, args) {
-            return Ok(());
-        }
-    }
-
-    let mut pending = vec![root.to_path_buf()];
-    while let Some(parent) = pending.pop() {
-        let entries = fs::read_dir(&parent)
-            .map_err(|e| format!("Read directory {:?} failed: {}", parent, e))?;
-        for entry in entries {
-            let entry = entry.map_err(|e| format!("Read directory entry in {:?} failed: {}", parent, e))?;
-            let file_type = entry.file_type()
-                .map_err(|e| format!("Read file type for {:?} failed: {}", entry.path(), e))?;
-            if !file_type.is_dir() {
-                continue;
-            }
-
-            let child = entry.path();
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if let Some(target_name) = legacy_target_name(&name, args) {
-                if !name.eq_ignore_ascii_case(target_name) {
-                    migrate_legacy_directory(&child, &parent.join(target_name))?;
-                }
-            } else if !is_current_output_name(&name, args) {
-                pending.push(child);
-            }
-        }
-    }
-    Ok(())
-}
-
-fn migrate_legacy_directory(source: &Path, destination: &Path) -> Result<(), String> {
-    if source == destination {
-        return Ok(());
-    }
-    match fs::symlink_metadata(destination) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            fs::rename(source, destination)
-                .map_err(|e| format!("Rename {:?} to {:?} failed: {}", source, destination, e))?;
-            println!("[INFO] Renamed legacy folder {:?} -> {:?}", source, destination);
-        }
-        Err(e) => return Err(format!("Inspect destination {:?} failed: {}", destination, e)),
-        Ok(metadata) if metadata.file_type().is_dir() => {
-            merge_legacy_directory_contents(source, destination)?;
-            fs::remove_dir(source)
-                .map_err(|e| format!("Remove migrated legacy folder {:?} failed: {}", source, e))?;
-            println!("[INFO] Merged legacy folder {:?} into {:?}", source, destination);
-        }
-        Ok(_) => return Err(format!("Migration destination exists and is not a directory: {:?}", destination)),
-    }
-    Ok(())
-}
-
-fn merge_legacy_directory_contents(source: &Path, destination: &Path) -> Result<(), String> {
-    let entries = fs::read_dir(source)
-        .map_err(|e| format!("Read legacy folder {:?} failed: {}", source, e))?;
-    for entry in entries {
-        let entry = entry.map_err(|e| format!("Read legacy folder entry in {:?} failed: {}", source, e))?;
-        let source_entry = entry.path();
-        let destination_entry = destination.join(entry.file_name());
-        let source_type = entry.file_type()
-            .map_err(|e| format!("Read file type for {:?} failed: {}", source_entry, e))?;
-        let destination_metadata = match fs::symlink_metadata(&destination_entry) {
-            Ok(metadata) => Some(metadata),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-            Err(e) => return Err(format!("Inspect {:?} failed: {}", destination_entry, e)),
-        };
-
-        if source_type.is_dir() && destination_metadata.as_ref().is_some_and(|m| m.file_type().is_dir()) {
-            merge_legacy_directory_contents(&source_entry, &destination_entry)?;
-            fs::remove_dir(&source_entry)
-                .map_err(|e| format!("Remove merged directory {:?} failed: {}", source_entry, e))?;
-        } else if destination_metadata.is_none() {
-            if source_type.is_file() {
-                if !transfer_no_replace(&source_entry, &destination_entry, false)? {
-                    move_legacy_conflict(&source_entry, destination, &entry.file_name())?;
-                }
-            } else {
-                fs::rename(&source_entry, &destination_entry)
-                    .map_err(|e| format!("Move {:?} to {:?} failed: {}", source_entry, destination_entry, e))?;
-            }
-        } else {
-            move_legacy_conflict(&source_entry, destination, &entry.file_name())?;
-        }
-    }
-    Ok(())
-}
-
-fn move_legacy_conflict(source: &Path, destination_dir: &Path, original_name: &std::ffi::OsStr) -> Result<(), String> {
-    let source_metadata = fs::symlink_metadata(source)
-        .map_err(|e| format!("Inspect conflict source {:?} failed: {}", source, e))?;
-    for index in 1..=10_000usize {
-        let destination = legacy_conflict_path(destination_dir, original_name, index);
-        if source_metadata.file_type().is_file() {
-            if transfer_no_replace(source, &destination, false)? {
-                println!("[INFO] Preserved filename conflict as {:?}", destination);
-                return Ok(());
-            }
-        } else if source_metadata.file_type().is_dir() {
-            match fs::create_dir(&destination) {
-                Ok(()) => {
-                    merge_legacy_directory_contents(source, &destination)?;
-                    fs::remove_dir(source)
-                        .map_err(|e| format!("Remove merged conflict folder {:?} failed: {}", source, e))?;
-                    println!("[INFO] Preserved folder conflict as {:?}", destination);
-                    return Ok(());
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(e) => return Err(format!("Create conflict folder {:?} failed: {}", destination, e)),
-            }
-        } else {
-            match fs::rename(source, &destination) {
-                Ok(()) => {
-                    println!("[INFO] Preserved filename conflict as {:?}", destination);
-                    return Ok(());
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(e) => return Err(format!("Move conflict {:?} to {:?} failed: {}", source, destination, e)),
-            }
-        }
-    }
-    Err(format!("Could not find a free conflict name for {:?}", source))
-}
-
-fn legacy_conflict_path(parent: &Path, name: &std::ffi::OsStr, index: usize) -> std::path::PathBuf {
-    let name = name.to_string_lossy();
-    let path = Path::new(name.as_ref());
-    if let Some(extension) = path.extension() {
-        let stem = path.file_stem().unwrap_or(std::ffi::OsStr::new(name.as_ref()));
-        parent.join(format!("{}__legacy_{}.{}", stem.to_string_lossy(), index, extension.to_string_lossy()))
-    } else {
-        parent.join(format!("{}__legacy_{}", name, index))
-    }
-}
-
 fn process_image(
     file_path: &Path,
     args: &Args,
     created_dirs: &DirectoryCache,
-) -> Result<TargetType, String> {
+    unavailable_reported: &Mutex<HashSet<PathBuf>>,
+) -> Result<ProcessResult, String> {
     let mut sink = ClassifierSink::default();
     // 子プロセス時代の隔離性を、ファイル単位の catch_unwind で代替する。
     let scan_result = catch_unwind(AssertUnwindSafe(|| {
-        fast_meta::scan_file(
-            file_path,
-            &fast_meta::ScanOptions::default(),
-            &mut sink,
-        )
+        fast_meta::scan_file(file_path, &fast_meta::ScanOptions::default(), &mut sink)
     }))
     .map_err(|_| "scan panicked".to_string())?;
     scan_result.map_err(|error| error.to_string())?;
 
     let target = sink.decide().unwrap_or(TargetType::None);
     if target == TargetType::None {
-        return Ok(TargetType::None);
+        return Ok(ProcessResult::SkippedNoMetadata);
     }
 
     // 親ディレクトリ取得
@@ -419,21 +217,42 @@ fn process_image(
 
     // 親ディレクトリ内にフォルダを作成
     let dest_dir = parent_dir.join(folder_name);
-
-    created_dirs.ensure(&dest_dir)?;
+    if let Err(error) = created_dirs.ensure(&dest_dir) {
+        // REQ-TRN-03: 出力フォルダを作成できない場合は「dest 作成不可」として別集計する。
+        // 同じ分類先についてのメッセージは 1 回までに抑える。
+        let first = unavailable_reported.lock().unwrap().insert(dest_dir.clone());
+        if first {
+            eprintln!(
+                "[WARN] Cannot create destination folder {:?} ({}); those files are left in place",
+                dest_dir, error
+            );
+        }
+        return Ok(ProcessResult::DestUnavailable);
+    }
 
     let file_name = file_path.file_name().ok_or("Cannot get file name")?;
     let dest_path = dest_dir.join(file_name);
-    if transfer_no_replace(file_path, &dest_path, args.copy)? {
-        Ok(target)
-    } else {
-        Ok(TargetType::None)
+    match transfer_no_replace(file_path, &dest_path, args.copy)? {
+        Transfer::Done => Ok(ProcessResult::Sorted(target)),
+        // REQ-TRN-01: dest 同名衝突は「メタデータ無し」と区別して集計する。
+        Transfer::DestinationExists => Ok(ProcessResult::DestConflict),
+        // REQ-TRN-02: 仕分けは完了したが元ファイルが残った（安全側）。警告として別集計。
+        Transfer::SourceRemains(warning) => Ok(ProcessResult::SortedWithWarning(target, warning)),
     }
+}
+
+/// 転送の結果。`DestinationExists` は dest を変更していない（既存ファイルを守る）。
+#[derive(Debug, Eq, PartialEq)]
+pub enum Transfer {
+    Done,
+    DestinationExists,
+    /// dest への転送は完了したが、元ファイルを削除できなかった（REQ-TRN-02）。
+    SourceRemains(String),
 }
 
 // Hard links provide an atomic no-replace move on the same filesystem. If unavailable,
 // create_new reserves the destination before copying; never truncate an existing file.
-fn transfer_no_replace(source: &Path, dest: &Path, copy: bool) -> Result<bool, String> {
+fn transfer_no_replace(source: &Path, dest: &Path, copy: bool) -> Result<Transfer, String> {
     let metadata = fs::symlink_metadata(source).map_err(|e| format!("Source metadata failed: {}", e))?;
     if !metadata.file_type().is_file() {
         return Err("Source is not a regular file".to_string());
@@ -441,17 +260,26 @@ fn transfer_no_replace(source: &Path, dest: &Path, copy: bool) -> Result<bool, S
     if !copy {
         match fs::hard_link(source, dest) {
             Ok(()) => {
-                fs::remove_file(source).map_err(|e| format!("Source removal failed after linking: {}", e))?;
-                return Ok(true);
+                return match fs::remove_file(source) {
+                    Ok(()) => Ok(Transfer::Done),
+                    Err(e) => Ok(Transfer::SourceRemains(format!(
+                        "Source removal failed after linking: {}",
+                        e
+                    ))),
+                };
             }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(false),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Ok(Transfer::DestinationExists)
+            }
             Err(_) => {} // Cross-device or unsupported: use an exclusive copy.
         }
     }
     let mut input = fs::File::open(source).map_err(|e| format!("Open source failed: {}", e))?;
     let mut output = match fs::OpenOptions::new().write(true).create_new(true).open(dest) {
         Ok(file) => file,
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(false),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Ok(Transfer::DestinationExists)
+        }
         Err(e) => return Err(format!("Create destination failed: {}", e)),
     };
     if let Err(e) = std::io::copy(&mut input, &mut output) {
@@ -463,14 +291,21 @@ fn transfer_no_replace(source: &Path, dest: &Path, copy: bool) -> Result<bool, S
     }
     drop(output);
     if !copy {
-        fs::remove_file(source).map_err(|e| format!("Source removal failed after copying: {}", e))?;
+        return match fs::remove_file(source) {
+            Ok(()) => Ok(Transfer::Done),
+            Err(e) => Ok(Transfer::SourceRemains(format!(
+                "Source removal failed after copying: {}",
+                e
+            ))),
+        };
     }
-    Ok(true)
+    Ok(Transfer::Done)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
     fn transfers_never_replace_existing_files() {
@@ -483,15 +318,24 @@ mod tests {
         fs::write(&source, b"source").unwrap();
         fs::write(&dest, b"existing").unwrap();
         for copy in [true, false] {
-            assert!(!transfer_no_replace(&source, &dest, copy).unwrap());
+            assert_eq!(
+                transfer_no_replace(&source, &dest, copy).unwrap(),
+                Transfer::DestinationExists
+            );
             assert_eq!(fs::read(&source).unwrap(), b"source");
             assert_eq!(fs::read(&dest).unwrap(), b"existing");
         }
         fs::remove_file(&dest).unwrap();
-        assert!(transfer_no_replace(&source, &dest, true).unwrap());
+        assert_eq!(
+            transfer_no_replace(&source, &dest, true).unwrap(),
+            Transfer::Done
+        );
         assert_eq!(fs::read(&source).unwrap(), b"source");
         fs::remove_file(&dest).unwrap();
-        assert!(transfer_no_replace(&source, &dest, false).unwrap());
+        assert_eq!(
+            transfer_no_replace(&source, &dest, false).unwrap(),
+            Transfer::Done
+        );
         assert!(!source.exists());
         assert_eq!(fs::read(&dest).unwrap(), b"source");
         fs::remove_dir_all(dir).unwrap();
@@ -509,7 +353,13 @@ mod tests {
         std::thread::scope(|scope| {
             let one = scope.spawn(|| transfer_no_replace(&a, &dest, true).unwrap());
             let two = scope.spawn(|| transfer_no_replace(&b, &dest, true).unwrap());
-            assert_ne!(one.join().unwrap(), two.join().unwrap());
+            let first = one.join().unwrap();
+            let second = two.join().unwrap();
+            // どちらか一方だけが dest を確保する（既存ファイルは上書きしない）。
+            assert_ne!(
+                matches!(first, Transfer::DestinationExists),
+                matches!(second, Transfer::DestinationExists)
+            );
         });
         let result = fs::read(&dest).unwrap();
         assert!(result == b"first" || result == b"second");
@@ -546,10 +396,12 @@ mod tests {
         fs::write(root.join("comfyui_img/c.png"), b"c").unwrap();
 
         let args = default_args();
-        let mut files = Vec::new();
-        collect_directory_images(&root, &args, &mut files).unwrap();
+        let mut collector = Collector::new(&args);
+        collector.collect_input(&root);
+        let (files, duplicates) = collector.finish();
 
         assert_eq!(files, vec![root.join("batch/a.png")]);
+        assert_eq!(duplicates, 0);
         assert!(!root.join("webui_image").exists());
         assert!(root.join("webui_img/b.png").is_file());
         assert!(root.join("comfyui_img/c.png").is_file());
