@@ -166,6 +166,7 @@ checksum = "48c757948c5ede0e46177b7add2e67155f70e33c07fea8284df6576da70b3719"
 [[package]]
 name = "fast_meta"
 version = "2.2.0"
+source = "git+https://github.com/wai55555/checkImageMetadata?tag=v2.2.0#b7968b17514b9b600bec0a9bc75d87f4b28e91db"
 dependencies = [
  "crc32fast",
  "flate2",
