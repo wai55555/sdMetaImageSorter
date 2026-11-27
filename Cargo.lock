@@ -165,8 +165,8 @@ checksum = "48c757948c5ede0e46177b7add2e67155f70e33c07fea8284df6576da70b3719"
 
 [[package]]
 name = "fast_meta"
-version = "2.2.0"
-source = "git+https://github.com/wai55555/checkImageMetadata?tag=v2.2.0#b7968b17514b9b600bec0a9bc75d87f4b28e91db"
+version = "2.3.0"
+source = "git+https://github.com/wai55555/checkImageMetadata?tag=v2.3.0#3c3eda6fc49318673fa4bcb44a3b74cdcfc475ae"
 dependencies = [
  "crc32fast",
  "flate2",
@@ -292,7 +292,7 @@ checksum = "28d3b2b1366ec20994f1fd18c3c594f05c5dd4bc44d8bb0c1c632c8d6829481f"
 
 [[package]]
 name = "sd_meta_tools"
-version = "2.1.0"
+version = "2.2.0"
 dependencies = [
  "clap",
  "fast_meta",
