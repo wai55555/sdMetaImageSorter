@@ -11,7 +11,9 @@ struct TempDir {
 
 impl TempDir {
     fn new() -> Self {
-        let path = std::env::temp_dir().join(format!(
+        // CARGO_TARGET_TMPDIR は target/ 配下。OS の一時ディレクトリは環境によって
+        // ACL（サンドボックス）が異なり、T-23 の削除権限テストが成立しないため使わない。
+        let path = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
             "sd-sorter-integration-{}-{}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
@@ -134,7 +136,7 @@ fn sorts_into_five_custom_folders_and_excludes_them_on_rerun() {
     assert!(stdout.contains("  -> NovelAI: 1"), "{stdout}");
     assert!(stdout.contains("  -> SwarmUI: 1"), "{stdout}");
     assert!(stdout.contains("  -> InvokeAI: 1"), "{stdout}");
-    assert!(stdout.contains("  -> Skipped: 1"), "{stdout}");
+    assert!(stdout.contains("  -> Skipped (no metadata): 1"), "{stdout}");
     assert!(stdout.contains("  -> Errors: 0"), "{stdout}");
 
     assert!(dir.path.join("CustomComfy/comfy.png").is_file());
@@ -199,7 +201,7 @@ fn novelai_option_long_name_and_legacy_alias_work() {
 }
 
 #[test]
-fn help_and_version_use_the_unified_option_and_2_0_1b() {
+fn help_and_version_use_the_unified_option_and_2_1_0() {
     let help = Command::new(env!("CARGO_BIN_EXE_sd_meta_sorter"))
         .arg("--help")
         .output()
@@ -215,7 +217,7 @@ fn help_and_version_use_the_unified_option_and_2_0_1b() {
     assert!(version.status.success());
     assert_eq!(
         String::from_utf8(version.stdout).unwrap().trim(),
-        "sd_meta_sorter 2.0.1b"
+        "sd_meta_sorter 2.1.0"
     );
 }
 
@@ -244,7 +246,7 @@ fn celsys_software_only_png_is_not_sorted() {
     assert!(stdout.contains("Total Scanned: 2"), "{stdout}");
     assert!(stdout.contains("  -> WebUI: 0"), "{stdout}");
     assert!(stdout.contains("  -> NovelAI: 0"), "{stdout}");
-    assert!(stdout.contains("  -> Skipped: 2"), "{stdout}");
+    assert!(stdout.contains("  -> Skipped (no metadata): 2"), "{stdout}");
     assert!(stdout.contains("  -> Errors: 0"), "{stdout}");
     // 元の場所に残る（移動されない）。
     assert!(dir.path.join("celsys.png").is_file());
@@ -319,7 +321,7 @@ fn jpeg_com_marks_decide_a1111_without_using_the_label() {
     );
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(stdout.contains("  -> WebUI: 1"), "{stdout}");
-    assert!(stdout.contains("  -> Skipped: 1"), "{stdout}");
+    assert!(stdout.contains("  -> Skipped (no metadata): 1"), "{stdout}");
     assert!(dir.path.join("CustomWebui/both.jpg").is_file());
     assert!(dir.path.join("one.jpg").is_file());
 }
@@ -344,4 +346,278 @@ fn xmp_packet_in_a_text_chunk_is_sorted_as_webui() {
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(stdout.contains("  -> WebUI: 1"), "{stdout}");
     assert!(dir.path.join("CustomWebui/text_xmp.png").is_file());
+}
+
+fn run_with(directory: &Path, extra: &[&str]) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_sd_meta_sorter"))
+        .arg(directory)
+        .args([
+            "-c",
+            "CustomComfy",
+            "-w",
+            "CustomWebui",
+            "-n",
+            "CustomNovel",
+            "-s",
+            "CustomSwarm",
+            "-i",
+            "CustomInvoke",
+        ])
+        .args(extra)
+        .output()
+        .expect("run sd_meta_sorter")
+}
+
+/// T-22（REQ-TRN-01）: dest 同名衝突を「メタデータ無し」と別集計にする。
+#[test]
+fn t22_dest_conflict_has_its_own_tally() {
+    let dir = TempDir::new();
+    write_png(
+        &dir.path,
+        "a1111.png",
+        &[text_chunk("parameters", "a cat\nSteps: 20")],
+    );
+    // --copy で元を残し、2 回目は同じ名前の dest が既にある状態にする。
+    let first = run_with(&dir.path, &["--copy"]);
+    assert!(first.status.success());
+    let second = run_with(&dir.path, &["--copy"]);
+    // 衝突はスキップ扱い（従来どおり終了コード 0）。
+    assert!(
+        second.status.success(),
+        "{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    let stdout = String::from_utf8(second.stdout).unwrap();
+    assert!(stdout.contains("  -> Skipped (dest conflict): 1"), "{stdout}");
+    assert!(stdout.contains("  -> Skipped (no metadata): 0"), "{stdout}");
+    assert!(stdout.contains("  -> Errors: 0"), "{stdout}");
+    assert!(dir.path.join("CustomWebui/a1111.png").is_file());
+    assert!(dir.path.join("a1111.png").is_file());
+}
+
+/// T-24（REQ-COL-03）: 存在しない入力パスは入力エラーとして集計し、
+/// 他の入力は処理したうえで終了コード 1。
+#[test]
+fn t24_missing_input_is_reported_and_exits_one() {
+    let dir = TempDir::new();
+    write_png(
+        &dir.path,
+        "a1111.png",
+        &[text_chunk("parameters", "a cat\nSteps: 20")],
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_sd_meta_sorter"))
+        .arg(dir.path.join("does-not-exist.png"))
+        .arg(&dir.path)
+        .args(["-c", "C", "-w", "W", "-n", "N", "-s", "S", "-i", "I"])
+        .output()
+        .expect("run sd_meta_sorter");
+
+    assert_eq!(output.status.code(), Some(1));
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("Input path does not exist"), "{stderr}");
+    assert!(stdout.contains("  -> Input errors: 1"), "{stdout}");
+    assert!(stdout.contains("  -> WebUI: 1"), "{stdout}");
+    assert!(dir.path.join("W/a1111.png").is_file());
+}
+
+/// T-25（REQ-COL-04）: 単一ファイル指定では親のサブツリー全体を移行しない。
+#[test]
+fn t25_single_file_input_does_not_migrate_the_whole_subtree() {
+    let dir = TempDir::new();
+    fs::create_dir_all(dir.path.join("sub/webui_image")).unwrap();
+    fs::write(dir.path.join("sub/webui_image/legacy.png"), b"legacy").unwrap();
+    write_png(
+        &dir.path,
+        "a1111.png",
+        &[text_chunk("parameters", "a cat\nSteps: 20")],
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_sd_meta_sorter"))
+        .arg(dir.path.join("a1111.png"))
+        .args(["-c", "C", "-w", "W", "-n", "N", "-s", "S", "-i", "I"])
+        .output()
+        .expect("run sd_meta_sorter");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // 親直下ではない旧フォルダは移行されない。
+    assert!(dir.path.join("sub/webui_image/legacy.png").is_file());
+    assert!(!dir.path.join("sub/W").exists());
+    // 指定ファイルは仕分けされる。
+    assert!(dir.path.join("W/a1111.png").is_file());
+}
+
+/// T-25b（REQ-COL-04）: 親直下の旧フォルダは移行される。
+#[test]
+fn t25b_single_file_input_migrates_legacy_sibling_folder() {
+    let dir = TempDir::new();
+    fs::create_dir_all(dir.path.join("webui_image")).unwrap();
+    fs::write(dir.path.join("webui_image/legacy.png"), b"legacy").unwrap();
+    write_png(
+        &dir.path,
+        "a1111.png",
+        &[text_chunk("parameters", "a cat\nSteps: 20")],
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_sd_meta_sorter"))
+        .arg(dir.path.join("a1111.png"))
+        .args(["-c", "C", "-w", "W", "-n", "N", "-s", "S", "-i", "I"])
+        .output()
+        .expect("run sd_meta_sorter");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!dir.path.join("webui_image").exists());
+    assert!(dir.path.join("W/legacy.png").is_file());
+    assert!(dir.path.join("W/a1111.png").is_file());
+}
+
+/// T-27（REQ-COL-05）: 直接指定にも拡張子フィルタと出力フォルダ除外を適用する。
+#[test]
+fn t27_direct_file_input_is_filtered_like_the_scan() {
+    let dir = TempDir::new();
+    fs::create_dir_all(dir.path.join("CustomWebui")).unwrap();
+    write_png(
+        &dir.path,
+        "CustomWebui/sorted.png",
+        &[text_chunk("parameters", "a cat\nSteps: 20")],
+    );
+    fs::write(dir.path.join("note.txt"), b"not an image").unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_sd_meta_sorter"))
+        .arg(dir.path.join("CustomWebui/sorted.png"))
+        .arg(dir.path.join("note.txt"))
+        .args(["-c", "CustomComfy", "-w", "CustomWebui"])
+        .output()
+        .expect("run sd_meta_sorter");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("Found 0 images"), "{stdout}");
+    assert!(
+        stdout.contains("  -> Excluded (output folder / unsupported): 2"),
+        "{stdout}"
+    );
+    // 入れ子の出力フォルダを作らない。
+    assert!(!dir.path.join("CustomWebui/CustomWebui").exists());
+    assert!(dir.path.join("CustomWebui/sorted.png").is_file());
+}
+
+/// T-28（REQ-COL-06）: フォルダ名の開始前検証は移動せずに終了コード 2。
+#[test]
+fn t28_invalid_folder_names_exit_with_two_and_move_nothing() {
+    let cases: &[&[&str]] = &[
+        &["-c", ""],
+        &["-c", "."],
+        &["-c", ".."],
+        &["-c", "a/b"],
+        &["-c", "a\\b"],
+        &["-c", "C:\\abs"],
+        &["-c", "same", "-w", "SAME"],
+    ];
+    for case in cases {
+        let dir = TempDir::new();
+        write_png(
+            &dir.path,
+            "a1111.png",
+            &[text_chunk("parameters", "a cat\nSteps: 20")],
+        );
+        let output = Command::new(env!("CARGO_BIN_EXE_sd_meta_sorter"))
+            .arg(&dir.path)
+            .args(*case)
+            .output()
+            .expect("run sd_meta_sorter");
+        assert_eq!(output.status.code(), Some(2), "case {:?}", case);
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(stderr.contains("Invalid output folder name"), "{stderr}");
+        // 1 ファイルも移動していない。
+        assert!(dir.path.join("a1111.png").is_file());
+        assert!(!dir.path.join("webui_img").exists());
+    }
+}
+
+/// T-34（REQ-TRN-03）: 出力フォルダ名と同名の通常ファイルがある場合は
+/// 「dest 作成不可」としてファイル単位で集計し、メッセージは分類先ごとに 1 回。
+#[test]
+fn t34_dest_unavailable_is_tallied_per_file() {
+    let dir = TempDir::new();
+    // `CustomWebui` という名前の通常ファイルが出力フォルダ作成を妨げる。
+    fs::write(dir.path.join("CustomWebui"), b"blocker").unwrap();
+    write_png(
+        &dir.path,
+        "one.png",
+        &[text_chunk("parameters", "a cat\nSteps: 20")],
+    );
+    write_png(
+        &dir.path,
+        "two.png",
+        &[text_chunk("parameters", "a dog\nSteps: 20")],
+    );
+
+    let output = run(&dir.path);
+    assert_eq!(output.status.code(), Some(1));
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("Total Scanned: 2"), "{stdout}");
+    assert!(stdout.contains("  -> Dest unavailable: 2"), "{stdout}");
+    assert!(stdout.contains("  -> Errors: 0"), "{stdout}");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert_eq!(
+        stderr.matches("Cannot create destination folder").count(),
+        1,
+        "{stderr}"
+    );
+    assert!(dir.path.join("one.png").is_file());
+    assert!(dir.path.join("two.png").is_file());
+}
+
+/// T-23（REQ-TRN-02）: 転送後の元削除失敗は警告として別集計し、終了コードは 1。
+/// Windows では、ファイル単位で削除権限を拒否（icacls (D)）して再現する。
+/// 権限設定に失敗する環境ではスキップする。
+#[cfg(windows)]
+#[test]
+fn t23_source_removal_failure_is_a_warning() {
+    let dir = TempDir::new();
+    write_png(
+        &dir.path,
+        "a1111.png",
+        &[text_chunk("parameters", "a cat\nSteps: 20")],
+    );
+    let source = dir.path.join("a1111.png");
+    let user = std::env::var("USERNAME").unwrap_or_default();
+    let deny = Command::new("icacls")
+        .arg(&source)
+        .args(["/deny", &format!("{}:(DE)", user)])
+        .output();
+    let denied = deny.as_ref().map(|o| o.status.success()).unwrap_or(false);
+    if !denied {
+        eprintln!("skipped T-23: cannot deny delete permission on this environment");
+        return;
+    }
+
+    let output = run(&dir.path);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+
+    let _ = Command::new("icacls")
+        .arg(&source)
+        .args(["/remove:d", &user])
+        .output();
+
+    assert!(stdout.contains("  -> WebUI: 1"), "{stdout} {stderr}");
+    assert!(
+        stdout.contains("  -> (warning) Source not removed: 1"),
+        "{stdout} {stderr}"
+    );
+    assert!(stdout.contains("  -> Errors: 0"), "{stdout} {stderr}");
+    assert_eq!(output.status.code(), Some(1));
+    assert!(dir.path.join("CustomWebui/a1111.png").is_file());
+    assert!(source.is_file());
 }
