@@ -9,7 +9,7 @@ use std::sync::Mutex;
 const LEGACY_WEBUI_OUTPUT_DIR_NAME: &str = "webui_image";
 
 #[derive(Parser)]
-#[command(name = "sd_meta_sorter", version = "2.1.0")]
+#[command(name = "sd_meta_sorter", version = "2.2.0")]
 struct Args {
     #[arg(required = true)]
     inputs: Vec<String>,
