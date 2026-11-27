@@ -104,7 +104,10 @@ fn sorts_into_five_custom_folders_and_excludes_them_on_rerun() {
     write_png(
         &dir.path,
         "novelai.png",
-        &[text_chunk("Comment", "{\"steps\":20}")],
+        &[text_chunk(
+            "Comment",
+            "{\"steps\":20,\"sampler\":\"k_euler\",\"scale\":11}",
+        )],
     );
     write_png(
         &dir.path,
@@ -176,7 +179,10 @@ fn novelai_option_long_name_and_legacy_alias_work() {
         write_png(
             &dir.path,
             "novelai.png",
-            &[text_chunk("Comment", "{\"steps\":20}")],
+            &[text_chunk(
+            "Comment",
+            "{\"steps\":20,\"sampler\":\"k_euler\",\"scale\":11}",
+        )],
         );
         let output = Command::new(env!("CARGO_BIN_EXE_sd_meta_sorter"))
             .arg(&dir.path)
@@ -211,4 +217,72 @@ fn help_and_version_use_the_unified_option_and_2_0_1b() {
         String::from_utf8(version.stdout).unwrap().trim(),
         "sd_meta_sorter 2.0.1b"
     );
+}
+
+/// N-02: 今回の実例（Celsys Studio Tool だけを持つ PNG）が仕分けされないこと。
+#[test]
+fn celsys_software_only_png_is_not_sorted() {
+    let dir = TempDir::new();
+    write_png(
+        &dir.path,
+        "celsys.png",
+        &[text_chunk("Software", "Celsys Studio Tool")],
+    );
+    write_png(
+        &dir.path,
+        "plain_comment.png",
+        &[text_chunk("Comment", "edited in MyPainter 2.0")],
+    );
+
+    let output = run(&dir.path);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("Total Scanned: 2"), "{stdout}");
+    assert!(stdout.contains("  -> WebUI: 0"), "{stdout}");
+    assert!(stdout.contains("  -> NovelAI: 0"), "{stdout}");
+    assert!(stdout.contains("  -> Skipped: 2"), "{stdout}");
+    assert!(stdout.contains("  -> Errors: 0"), "{stdout}");
+    // 元の場所に残る（移動されない）。
+    assert!(dir.path.join("celsys.png").is_file());
+    assert!(dir.path.join("plain_comment.png").is_file());
+    assert!(!dir.path.join("CustomWebui").exists());
+    assert!(!dir.path.join("CustomNovel").exists());
+}
+
+/// P-01／P-04: 正例は従来どおり仕分けされること（回帰防止）。
+#[test]
+fn positive_samples_still_sort_into_their_folders() {
+    let dir = TempDir::new();
+    write_png(
+        &dir.path,
+        "a1111.png",
+        &[text_chunk("parameters", "a cat\nNegative prompt: blur\nSteps: 20")],
+    );
+    write_png(
+        &dir.path,
+        "novelai.png",
+        &[
+            text_chunk("Description", "a cat"),
+            text_chunk(
+                "Comment",
+                "{\"uc\":\"blur\",\"steps\":28,\"sampler\":\"k_euler_ancestral\",\"scale\":11,\"seed\":1}",
+            ),
+        ],
+    );
+
+    let output = run(&dir.path);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("  -> WebUI: 1"), "{stdout}");
+    assert!(stdout.contains("  -> NovelAI: 1"), "{stdout}");
+    assert!(dir.path.join("CustomWebui/a1111.png").is_file());
+    assert!(dir.path.join("CustomNovel/novelai.png").is_file());
 }

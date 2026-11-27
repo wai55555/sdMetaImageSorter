@@ -297,6 +297,7 @@ dependencies = [
  "clap",
  "fast_meta",
  "rayon",
+ "serde_json",
 ]
 
 [[package]]
