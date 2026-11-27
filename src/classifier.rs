@@ -4,7 +4,9 @@
 //! 「キー＋値のパターン」だけで判定する。表示ラベルや生成元の推定は使わない。
 //! 存在だけのシグナル（Software の有無、XMP の有無）は数えない（REQ-CLS-11／02）。
 
-use fast_meta::{RecordSink, RecordView, Source};
+use fast_meta::{
+    RecordSink, RecordView, Source, JPEG_COM_A1111_BOTH_MARKERS, JPEG_COM_A1111_ONE_MARKER,
+};
 use serde_json::Value;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -217,6 +219,7 @@ pub struct ClassifierSink {
     weak_webui_negprompt: bool,
     weak_webui_stealth_present: bool,
     weak_webui_trailing: bool,
+    weak_webui_jpeg_com: bool,
     weak_novelai_trailing: bool,
     weak_novelai_stealth: bool,
     /// ComfyUI 方向の弱（`usercomment_workflow_substr`／`stealth_workflow_substr`）。
@@ -344,10 +347,12 @@ impl RecordSink for ClassifierSink {
         }
 
         if record.source == Source::JpegComment {
-            // Phase 1 暫定: fast_meta の構造化印（REQ-API-01）が未実装のため、
-            // 暫定で label 判定を残す。Phase 2 で detail の印へ置き換え、label 依存を撤去する。
-            if record.label == "Stable Diffusion (A1111)" {
-                self.webui_medium = true;
+            // REQ-CLS-04: 表示ラベル（label）ではなく、fast_meta が渡す構造化された印で判定する。
+            // 両マーカーあり＝中、片方のみ＝弱（REQ-API-01）。
+            match record.detail.as_deref() {
+                Some(JPEG_COM_A1111_BOTH_MARKERS) => self.webui_medium = true,
+                Some(JPEG_COM_A1111_ONE_MARKER) => self.weak_webui_jpeg_com = true,
+                _ => {}
             }
         }
 
@@ -380,6 +385,7 @@ impl ClassifierSink {
             + usize::from(self.weak_webui_negprompt)
             + usize::from(self.weak_webui_stealth_present)
             + usize::from(self.weak_webui_trailing)
+            + usize::from(self.weak_webui_jpeg_com)
     }
 
     /// §8.3 の決定手順。上が優先。
@@ -441,6 +447,19 @@ mod tests {
         }
     }
 
+    fn record_with_detail(
+        source: Source,
+        label: &'static str,
+        body: &'static str,
+        keyword: Option<&'static str>,
+        detail: &'static str,
+    ) -> RecordView<'static> {
+        RecordView {
+            detail: Some(Cow::Borrowed(detail)),
+            ..record(source, label, body, keyword)
+        }
+    }
+
     fn classify(records: &[RecordView<'_>]) -> TargetType {
         let mut sink = ClassifierSink::default();
         for record in records {
@@ -460,7 +479,6 @@ mod tests {
     }
 
     /// §10.1／§10.2 のフィクスチャ（レコード単位）。期待値は仕様書の行き先。
-    /// `N-11` は REQ-CLS-04 の構造化印が Phase 2 のため除外し、個別テストで暫定挙動を固定する。
     fn fixtures() -> Vec<(&'static str, Vec<RecordView<'static>>, TargetType)> {
         use Source::*;
         vec![
@@ -482,6 +500,13 @@ mod tests {
             ("N-08", vec![record(JpegExif, "EXIF ImageDescription", "A staircase with Steps: 3", Some("ImageDescription"))], TargetType::None),
             ("N-09", vec![record(PngStealth, "Stealth PNG Info (Alpha) [stealth_pnginfo]", "a workflow diagram, watercolor", None)], TargetType::None),
             ("N-10", vec![record(Trailing, "Trailing Data (after IEND)", "{\"Software\":\"Celsys Studio Tool\"}", None)], TargetType::None),
+            ("N-11", vec![record_with_detail(
+                JpegComment,
+                "Stable Diffusion (A1111)",
+                "Steps: 20 photo comment",
+                None,
+                JPEG_COM_A1111_ONE_MARKER,
+            )], TargetType::None),
             ("N-12", vec![png("Comment", "{\"width\":512,\"height\":512}", "Comment")], TargetType::None),
             ("N-13", vec![record(JpegExif, "EXIF UserComment", "the workflow is described here", Some("UserComment"))], TargetType::None),
             ("N-14", vec![record(JpegExif, "EXIF ImageDescription", "Negative prompt: none used", Some("ImageDescription"))], TargetType::None),
@@ -510,7 +535,13 @@ mod tests {
             ("P-12", vec![record(PngXmp, "XMP UserComment", "{\"c\":\"a cat\",\"uc\":\"blur\",\"steps\":20,\"sampler\":\"euler\",\"seed\":1,\"size\":\"512x512\"}", Some("UserComment"))], TargetType::WebUI),
             ("P-13", vec![record(PngXmp, "XMP AIPromptInformation", "a cat", Some("AIPromptInformation"))], TargetType::WebUI),
             ("P-13b", vec![record(JpegXmp, "XMP DigitalSourceType", "http://cv.iptc.org/newscodes/digitalsourcetype/trainedAlgorithmicMedia", Some("DigitalSourceType"))], TargetType::WebUI),
-            ("P-14", vec![record(JpegComment, "Stable Diffusion (A1111)", "a cat\nNegative prompt: blur\nSteps: 20", None)], TargetType::WebUI),
+            ("P-14", vec![record_with_detail(
+                JpegComment,
+                "Stable Diffusion (A1111)",
+                "a cat\nNegative prompt: blur\nSteps: 20",
+                None,
+                JPEG_COM_A1111_BOTH_MARKERS,
+            )], TargetType::WebUI),
             ("P-15", vec![
                 record(Trailing, "Trailing Data (after IEND)", "a cat\nNegative prompt: blur\nSteps: 20", None),
                 record(JpegExif, "EXIF UserComment", "a cat\nSteps: 20", Some("UserComment")),
@@ -554,20 +585,58 @@ mod tests {
         assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 
-    /// Phase 1 の暫定（label 判定）。Phase 2 で REQ-CLS-04 の構造化印へ置き換える。
+    /// T-06（REQ-CLS-04）: COM の分類は label 文字列に依存しない。
     #[test]
-    fn phase1_provisional_jpeg_comment_still_uses_label() {
+    fn t06_com_classification_does_not_depend_on_the_label() {
+        // label を任意の文字列に変えても、detail の印が同じなら行き先は変わらない。
+        for label in [
+            "Stable Diffusion (A1111)",
+            "JPEG Comment",
+            "任意のラベル",
+            "",
+        ] {
+            let both = [RecordView {
+                ..record_with_detail(
+                    Source::JpegComment,
+                    "Stable Diffusion (A1111)",
+                    "a cat\nNegative prompt: blur\nSteps: 20",
+                    None,
+                    JPEG_COM_A1111_BOTH_MARKERS,
+                )
+            }];
+            let mut both = both;
+            both[0].label = Cow::Borrowed(label);
+            assert_eq!(
+                classify(&both),
+                TargetType::WebUI,
+                "label={label} with both markers must be WebUI"
+            );
+
+            let partial = [RecordView {
+                ..record_with_detail(
+                    Source::JpegComment,
+                    "Stable Diffusion (A1111)",
+                    "Steps: 20 photo comment",
+                    None,
+                    JPEG_COM_A1111_ONE_MARKER,
+                )
+            }];
+            let mut partial = partial;
+            partial[0].label = Cow::Borrowed(label);
+            assert_eq!(
+                classify(&partial),
+                TargetType::None,
+                "label={label} with one marker must stay unsorted"
+            );
+        }
+        // 印が無い COM は label が A1111 でも確定しない。
         assert_eq!(
             classify(&[record(
                 Source::JpegComment,
                 "Stable Diffusion (A1111)",
-                "Steps: 20 photo comment",
+                "a cat\nNegative prompt: blur\nSteps: 20",
                 None
             )]),
-            TargetType::WebUI
-        );
-        assert_eq!(
-            classify(&[record(Source::JpegComment, "JPEG Comment", "plain", None)]),
             TargetType::None
         );
     }
@@ -704,19 +773,4 @@ mod tests {
         );
     }
 
-
-    /// N-11 は Phase 2 で確定する（REQ-CLS-04 の構造化印が必要）。
-    #[test]
-    fn n11_is_pending_until_phase2() {
-        // Phase 1 の暫定 label 判定では WebUI に落ちることを明示的に記録する。
-        assert_eq!(
-            classify(&[record(
-                Source::JpegComment,
-                "Stable Diffusion (A1111)",
-                "Steps: 20 photo comment",
-                None
-            )]),
-            TargetType::WebUI
-        );
-    }
 }
